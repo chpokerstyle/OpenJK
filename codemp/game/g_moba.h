@@ -12,10 +12,22 @@ MagicWands MOBA mod - OpenJK game code (server-side)
 #define MOBA_MAX_ITEMS			6
 #define MOBA_MAX_SKILL_LEVEL	5
 
+// ---- Captain draft ----
+// The draft runs once per match: three stages, each one bans
+// MOBA_DRAFT_BANS_PER_CAPTAIN heroes per captain and then picks
+// MOBA_DRAFT_PICKS_PER_STAGE per captain. What is left over after the second
+// stage is taken in the third one, which is the single pick of a 5v5.
+#define MOBA_DRAFT_STAGES			3
+#define MOBA_DRAFT_BANS_PER_CAPTAIN	2
+#define MOBA_DRAFT_PICKS_PER_STAGE	2
+#define MOBA_DRAFT_ACTIONS_MAX		( MOBA_DRAFT_STAGES * ( MOBA_DRAFT_BANS_PER_CAPTAIN + MOBA_DRAFT_PICKS_PER_STAGE ) * 2 )
+
 // ---- Phases of a MOBA round ----
+// cg_moba.c mirrors the numbering of this enum, keep both in sync.
 typedef enum {
 	MOBA_PHASE_LOBBY = 0,
-	MOBA_PHASE_DRAFT,			// hero pick
+	MOBA_PHASE_DRAFT,			// captains ban and pick
+	MOBA_PHASE_DRAFT_ASSIGN,	// every player takes a hero out of his team pool
 	MOBA_PHASE_BUY,				// pre-round shop
 	MOBA_PHASE_FIGHT,			// combat round
 	MOBA_PHASE_ROUNDEND			// brief intermission between rounds

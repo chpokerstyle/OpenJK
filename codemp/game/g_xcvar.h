@@ -179,10 +179,16 @@ XCVAR_DEF( moba_log,					"0",			NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_startGold,			"1000",		NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_auto,					"",				NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_autoEvery,				"1500",			NULL,						CVAR_LATCH,										qtrue )
+// resolves every draft step with a random hero instead of waiting out the clock
+// and prefers human captains, so a draft can be run headless or driven by hand
+XCVAR_DEF( moba_autodraft,				"0",			NULL,						CVAR_LATCH,										qtrue )
+XCVAR_DEF( moba_autodraftEvery,			"1000",			NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_testkill,				"-1",			NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_testkick,				"-1",			NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_bots,					"0",				NULL,						CVAR_LATCH,										qtrue )
-XCVAR_DEF( moba_pickTime,				"60",			NULL,						CVAR_LATCH,										qtrue )
+// seconds per draft step: one ban or pick, and the window the whole team has to
+// take a hero out of its pool afterwards
+XCVAR_DEF( moba_pickTime,				"30",			NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_buyTime,				"12",			NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_roundEndTime,			"6",			NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( pmove_fixed,					"0",			NULL,						CVAR_SYSTEMINFO|CVAR_ARCHIVE,					qtrue )

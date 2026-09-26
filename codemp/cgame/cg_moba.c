@@ -40,8 +40,9 @@ static const cgMobaItem_t cgMobaItems[] = {
 
 #define CG_MOBA_NUM_ITEMS	( (int)( sizeof( cgMobaItems ) / sizeof( cgMobaItems[0] ) ) )
 
-// mirrors mobaPhase_t from g_moba.h: LOBBY 0, DRAFT 1, BUY 2, FIGHT 3, ROUNDEND 4
-#define CG_MOBA_PHASE_BUY	2
+// mirrors mobaPhase_t from g_moba.h, keep both in sync: LOBBY 0, DRAFT 1,
+// DRAFT_ASSIGN 2, BUY 3, FIGHT 4, ROUNDEND 5
+#define CG_MOBA_PHASE_BUY	3
 
 //=========================================================================
 // State received from the server plus the local "the player closed it again"

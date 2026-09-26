@@ -1,4 +1,4 @@
-/*
+﻿/*
 ===========================================================================
 MagicWands MOBA mod - OpenJK game code (server-side) - implementation
 ===========================================================================
@@ -12,6 +12,11 @@ void SetTeamQuick(gentity_t *ent, int team, qboolean doBegin);
 static void MOBA_LoadHeroes( void );
 static int MOBA_AbilityPower( gentity_t *ent, const mobaAbility_t *ab );
 static void MOBA_BuyItem( gentity_t *ent, int id );
+static void MOBA_StartDraft( void );
+static void MOBA_StartAssign( void );
+static void MOBA_DraftPrompt( void );
+static void MOBA_TransferCaptain( int seat, const char *why );
+static void MOBA_RunAutoDraft( void );
 
 #define MOBA_DEFAULT_MAXHEALTH	500
 #define MOBA_DEFAULT_ARMOR		50
@@ -31,6 +36,16 @@ static void MOBA_BuyItem( gentity_t *ent, int id );
 
 #define MOBA_FALLBACK_RESPAWN	3600000	// 1h - effectively never (round-based respawn)
 
+typedef enum {
+	MOBA_DRAFT_BAN = 0,
+	MOBA_DRAFT_PICK
+} mobaDraftAction_t;
+
+// The captain array and the plan are indexed by seat, not by team: this engine
+// numbers TEAM_FREE 0, TEAM_RED 1 and TEAM_BLUE 2, so a team_t can never be used
+// as an index.
+#define MOBA_DRAFT_SEATS	2
+
 static qboolean mobaEnabled = qfalse;
 static mobaPhase_t mobaPhase = MOBA_PHASE_LOBBY;
 static int mobaPhaseEnd = 0;
@@ -39,6 +54,31 @@ static int mobaRedAlive = 0, mobaBlueAlive = 0;
 static int mobaRedPlayers = 0, mobaBluePlayers = 0;
 
 mobaPlayer_t mobaPlayers[MAX_CLIENTS];
+
+// ---- Draft state, the draft runs once per match ----
+// The plan is a flat list of (action, seat) pairs that is built from the roster
+// at draft start, so the walk through it needs no per captain counters.
+static qboolean mobaHeroBanned[MOBA_MAX_HEROES];
+static team_t mobaHeroTeam[MOBA_MAX_HEROES];		// TEAM_FREE = still up for grabs
+
+static qboolean mobaDraftDone;					// a draft finished in this match
+static int mobaCaptain[MOBA_DRAFT_SEATS];		// clientNum of the captain per seat
+static mobaDraftAction_t mobaDraftPlan[MOBA_DRAFT_ACTIONS_MAX];
+static int mobaDraftActor[MOBA_DRAFT_ACTIONS_MAX];
+static int mobaDraftPlanLen = 0;
+static int mobaDraftStep = 0;					// index of the step to resolve
+static int mobaDraftFirst = 0;					// seat that opens every stage
+static int mobaAutoDraftNext = 0;				// level.time of the next auto step
+
+static team_t MOBA_SeatTeam( int seat )
+{
+	return ( seat == 0 ) ? TEAM_RED : TEAM_BLUE;
+}
+
+static int MOBA_TeamSeat( team_t team )
+{
+	return ( team == TEAM_RED ) ? 0 : 1;
+}
 
 //=========================================================================
 // Hero / item tables
@@ -154,6 +194,353 @@ static void MOBA_Self( gentity_t *ent, const char *fmt, ... )
 
 
 //=========================================================================
+// Captain draft - one ban/pick plan per match
+//=========================================================================
+
+static qboolean MOBA_SlotActive( int clientNum )
+{
+	gentity_t *ent;
+
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS )
+	{
+		return qfalse;
+	}
+
+	ent = &g_entities[clientNum];
+
+	return ( ent->inuse && ent->client &&
+		ent->client->pers.connected == CON_CONNECTED ) ? qtrue : qfalse;
+}
+
+static int MOBA_TeamSize( team_t team )
+{
+	int i, count = 0;
+
+	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+	{
+		if ( MOBA_SlotActive( i ) && g_entities[i].client->sess.sessionTeam == team )
+		{
+			count++;
+		}
+	}
+
+	return count;
+}
+
+static void MOBA_ResetHeroPool( void )
+{
+	int i;
+
+	for ( i = 0; i < MOBA_MAX_HEROES; i++ )
+	{
+		mobaHeroBanned[i] = qfalse;
+		mobaHeroTeam[i] = TEAM_FREE;
+	}
+
+	mobaDraftPlanLen = 0;
+	mobaDraftStep = 0;
+	mobaCaptain[0] = -1;
+	mobaCaptain[1] = -1;
+}
+
+// One captain per team, drawn at random. With the autodraft aid on a human is
+// preferred, so the draft can be driven from a real client while the bots would
+// eat both captain jobs.
+static int MOBA_ElectCaptain( team_t team )
+{
+	int i, humans[MAX_CLIENTS], anyone[MAX_CLIENTS], numHumans = 0, numAny = 0;
+	int *pool, num;
+
+	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+	{
+		if ( !MOBA_SlotActive( i ) || g_entities[i].client->sess.sessionTeam != team )
+		{
+			continue;
+		}
+
+		anyone[numAny++] = i;
+		if ( !( g_entities[i].r.svFlags & SVF_BOT ) )
+		{
+			humans[numHumans++] = i;
+		}
+	}
+
+	pool = ( moba_autodraft.integer && numHumans > 0 ) ? humans : anyone;
+	num = ( moba_autodraft.integer && numHumans > 0 ) ? numHumans : numAny;
+
+	if ( num <= 0 )
+	{
+		return -1;
+	}
+
+	return pool[Q_irand( 0, num - 1 )];
+}
+
+// A captain that goes quiet or leaves hands the job to another player of the
+// team. A team alone keeps the job, the step then simply times out.
+static void MOBA_TransferCaptain( int seat, const char *why )
+{
+	int i, start, guard, candidates[MAX_CLIENTS], count = 0;
+	int old = mobaCaptain[seat];
+	team_t team = MOBA_SeatTeam( seat );
+	gentity_t *ent;
+
+	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+	{
+		if ( i == old || !MOBA_SlotActive( i ) )
+		{
+			continue;
+		}
+		if ( g_entities[i].client->sess.sessionTeam != team )
+		{
+			continue;
+		}
+
+		candidates[count++] = i;
+	}
+
+	if ( count <= 0 )
+	{
+		return;
+	}
+
+	start = Q_irand( 0, count - 1 );
+	mobaCaptain[seat] = candidates[start];
+	ent = &g_entities[mobaCaptain[seat]];
+
+	MOBA_CPAll( "^3Captaincy of the %s team passes to %s (%s)\n",
+		team == TEAM_RED ? "^1red^7" : "^1blue^7", ent->client->pers.netname, why );
+	MOBA_CPSelf( ent, "You are the ^3captain^7 now.\n" );
+}
+
+// Builds the flat step list from the current roster: three stages of two bans
+// per captain, each followed by two picks per captain. Whatever is still
+// unpicked after the second stage is taken in the third one, so a 5v5 ends on a
+// single pick per captain. The number of bans shrinks if the roster is too big
+// for the hero pool.
+static void MOBA_BuildDraftPlan( void )
+{
+	int stage, i, seat, bans[MOBA_DRAFT_SEATS], picks[MOBA_DRAFT_SEATS];
+	int banBudget, totalPicks;
+
+	totalPicks = MOBA_TeamSize( TEAM_RED ) + MOBA_TeamSize( TEAM_BLUE );
+
+	// every pick needs a hero of its own, whatever is left pays for the bans
+	banBudget = ( mobaNumHeroes - totalPicks ) / 2;
+	if ( banBudget > MOBA_DRAFT_STAGES * MOBA_DRAFT_BANS_PER_CAPTAIN )
+	{
+		banBudget = MOBA_DRAFT_STAGES * MOBA_DRAFT_BANS_PER_CAPTAIN;
+	}
+	if ( banBudget < 0 )
+	{
+		banBudget = 0;
+	}
+
+	for ( seat = 0; seat < MOBA_DRAFT_SEATS; seat++ )
+	{
+		bans[seat] = banBudget;
+		// a captain picks as many heroes as his own team has players
+		picks[seat] = MOBA_TeamSize( MOBA_SeatTeam( seat ) );
+	}
+
+	mobaDraftFirst = Q_irand( 0, MOBA_DRAFT_SEATS - 1 );
+	mobaDraftPlanLen = 0;
+
+	for ( stage = 0; stage < MOBA_DRAFT_STAGES; stage++ )
+	{
+		// ban part: MOBA_DRAFT_BANS_PER_CAPTAIN per captain, one hero per turn
+		for ( i = 0; i < MOBA_DRAFT_BANS_PER_CAPTAIN * 2; i++ )
+		{
+			seat = ( mobaDraftFirst + i ) % MOBA_DRAFT_SEATS;
+			if ( bans[seat] <= 0 || mobaDraftPlanLen >= MOBA_DRAFT_ACTIONS_MAX )
+			{
+				continue;
+			}
+
+			bans[seat]--;
+			mobaDraftPlan[mobaDraftPlanLen] = MOBA_DRAFT_BAN;
+			mobaDraftActor[mobaDraftPlanLen] = seat;
+			mobaDraftPlanLen++;
+		}
+
+		// pick part: MOBA_DRAFT_PICKS_PER_STAGE per captain while both still
+		// have picks left, the last stage takes the remainder
+		for ( i = 0; i < MOBA_DRAFT_PICKS_PER_STAGE * 2; i++ )
+		{
+			seat = ( mobaDraftFirst + i ) % MOBA_DRAFT_SEATS;
+			if ( picks[seat] <= 0 || mobaDraftPlanLen >= MOBA_DRAFT_ACTIONS_MAX )
+			{
+				continue;
+			}
+
+			picks[seat]--;
+			mobaDraftPlan[mobaDraftPlanLen] = MOBA_DRAFT_PICK;
+			mobaDraftActor[mobaDraftPlanLen] = seat;
+			mobaDraftPlanLen++;
+		}
+	}
+}
+
+// A hero that is neither banned nor picked yet, picked at random.
+static int MOBA_DraftFreeHero( void )
+{
+	int i, start, guard;
+
+	if ( mobaNumHeroes <= 0 )
+	{
+		return -1;
+	}
+
+	start = Q_irand( 0, mobaNumHeroes - 1 );
+	for ( guard = 0; guard < mobaNumHeroes; guard++ )
+	{
+		i = ( start + guard ) % mobaNumHeroes;
+		if ( !mobaHeroBanned[i] && mobaHeroTeam[i] == TEAM_FREE )
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+// The heroes a team picked in the captain stage, in pick order. Returns the
+// count and fills the array, the pool can hold every hero of the match.
+static int MOBA_TeamPool( team_t team, int *heroIds, int maxIds )
+{
+	int i, count = 0;
+
+	for ( i = 0; i < mobaNumHeroes && count < maxIds; i++ )
+	{
+		if ( mobaHeroTeam[i] == team )
+		{
+			heroIds[count++] = i;
+		}
+	}
+
+	return count;
+}
+
+static qboolean MOBA_IsActingCaptain( gentity_t *ent )
+{
+	if ( !ent || !ent->client || mobaDraftStep >= mobaDraftPlanLen )
+	{
+		return qfalse;
+	}
+
+	return ( mobaCaptain[mobaDraftActor[mobaDraftStep]] == ent->s.number ) ? qtrue : qfalse;
+}
+
+static void MOBA_DraftPrompt( void )
+{
+	int seat, captain, secs;
+	team_t team;
+	gentity_t *ent;
+	qboolean ban;
+
+	if ( mobaDraftStep >= mobaDraftPlanLen )
+	{
+		return;
+	}
+
+	seat = mobaDraftActor[mobaDraftStep];
+	team = MOBA_SeatTeam( seat );
+	captain = mobaCaptain[seat];
+	ban = ( mobaDraftPlan[mobaDraftStep] == MOBA_DRAFT_BAN ) ? qtrue : qfalse;
+	secs = ( mobaPhaseEnd - level.time ) / 1000;
+
+	MOBA_CPAll( "^3Draft %i/%i^7 - the %s team has to ^3%s^7 a hero (%i s)\n",
+		mobaDraftStep + 1, mobaDraftPlanLen,
+		team == TEAM_RED ? "^1red^7" : "^1blue^7", ban ? "ban" : "pick", secs );
+
+	if ( !MOBA_SlotActive( captain ) )
+	{
+		// nobody is left to act, the step resolves itself on the clock
+		MOBA_TransferCaptain( seat, "no captain" );
+		return;
+	}
+
+	ent = &g_entities[captain];
+	MOBA_CPSelf( ent, "You are the ^3captain^7! Type ^3!%s N^7, !heroes lists the pool (%i s)\n",
+		ban ? "ban" : "pick", secs );
+}
+
+// Resolves the current step: with a hero the captain named, or with a random
+// one when heroId is negative. A negative id also covers the timeout and the
+// autodraft aid, which cannot fail on an empty pool and just skip the step.
+static qboolean MOBA_DraftCommit( int heroId, const char *how )
+{
+	int seat, captain;
+	team_t team;
+	qboolean ban, blind = ( heroId < 0 ) ? qtrue : qfalse;
+	const char *capName;
+
+	if ( mobaDraftStep >= mobaDraftPlanLen )
+	{
+		return qfalse;
+	}
+
+	seat = mobaDraftActor[mobaDraftStep];
+	team = MOBA_SeatTeam( seat );
+	captain = mobaCaptain[seat];
+	ban = ( mobaDraftPlan[mobaDraftStep] == MOBA_DRAFT_BAN ) ? qtrue : qfalse;
+
+	if ( blind )
+	{
+		heroId = MOBA_DraftFreeHero();
+	}
+	else if ( heroId < 0 || heroId >= mobaNumHeroes || mobaHeroBanned[heroId] ||
+		mobaHeroTeam[heroId] != TEAM_FREE )
+	{
+		return qfalse;
+	}
+
+	if ( heroId >= 0 )
+	{
+		if ( ban )
+		{
+			mobaHeroBanned[heroId] = qtrue;
+		}
+		else
+		{
+			mobaHeroTeam[heroId] = team;
+		}
+
+		capName = MOBA_SlotActive( captain ) ?
+			g_entities[captain].client->pers.netname : "the team";
+
+		if ( ban )
+		{
+			MOBA_CPAll( "^1BAN^7 - %s (%s) bans ^5%s^7\n", capName, how,
+				mobaHeroes[heroId].name );
+		}
+		else
+		{
+			MOBA_CPAll( "^2PICK^7 - %s (%s) takes ^5%s^7 for the %s team\n", capName, how,
+				mobaHeroes[heroId].name, team == TEAM_RED ? "^1red^7" : "^1blue^7" );
+		}
+	}
+	else
+	{
+		MOBA_CPAll( "^3Draft step skipped, no hero left (%s)\n", how );
+	}
+
+	mobaDraftStep++;
+	mobaPhaseEnd = level.time + moba_pickTime.integer * 1000;
+
+	if ( mobaDraftStep >= mobaDraftPlanLen )
+	{
+		MOBA_StartAssign();
+	}
+	else
+	{
+		MOBA_DraftPrompt();
+	}
+
+	return qtrue;
+}
+
+//=========================================================================
 // Hero assignment
 //=========================================================================
 
@@ -163,7 +550,9 @@ static qboolean MOBA_HeroTaken( int heroId )
 
 	for ( i = 0; i < MAX_CLIENTS; i++ )
 	{
-		if ( mobaPlayers[i].inuse && mobaPlayers[i].heroId == heroId )
+		// the connection, not the spawn, owns the hero: a client that has not
+		// spawned yet still blocks the hero it was given
+		if ( MOBA_SlotActive( i ) && mobaPlayers[i].heroId == heroId )
 		{
 			return qtrue;
 		}
@@ -172,37 +561,58 @@ static qboolean MOBA_HeroTaken( int heroId )
 	return qfalse;
 }
 
-// Hands a free hero to every player that has none, so the draft falling through
-// on a timeout costs a choice and not the whole round. Must run before the
-// respawn of the buy phase, the stats are only applied on spawn.
+// Hands a hero to every player that has none: a player who sat out the assign
+// stage gets one out of the pool of his own team first and any free hero only if
+// that pool is used up. Must run before the respawn of the buy phase, the stats
+// are only applied on spawn.
 static void MOBA_FillMissingHeroes( void )
 {
-	int i, heroId, guard;
+	int i, heroId, guard, pool[MOBA_MAX_HEROES], poolCount, j;
+	team_t team;
 
 	for ( i = 0; i < level.maxclients; i++ )
 	{
 		gentity_t *ent = &g_entities[i];
 
-		if ( !mobaPlayers[i].inuse || mobaPlayers[i].heroId >= 0 )
+		if ( !MOBA_SlotActive( i ) || mobaPlayers[i].heroId >= 0 )
 		{
 			continue;
 		}
 
-		// start random and walk on until a free hero shows up, with fewer
-		// clients than heroes the walk always ends before the list runs out
-		heroId = Q_irand( 0, mobaNumHeroes - 1 );
-		for ( guard = 0; guard < mobaNumHeroes && MOBA_HeroTaken( heroId ); guard++ )
+		team = ent->client->sess.sessionTeam;
+		heroId = -1;
+
+		// own team pool first, the captains picked exactly one hero per player
+		if ( team == TEAM_RED || team == TEAM_BLUE )
 		{
-			heroId = ( heroId + 1 ) % mobaNumHeroes;
+			poolCount = MOBA_TeamPool( team, pool, ARRAY_LEN( pool ) );
+			for ( j = 0; j < poolCount; j++ )
+			{
+				if ( !MOBA_HeroTaken( pool[j] ) )
+				{
+					heroId = pool[j];
+					break;
+				}
+			}
+		}
+
+		// fall back to any free hero, a team that grew after the draft has no
+		// pool left for its late joiners
+		if ( heroId < 0 )
+		{
+			// start random and walk on until a free hero shows up, with fewer
+			// clients than heroes the walk always ends before the list runs out
+			heroId = Q_irand( 0, mobaNumHeroes - 1 );
+			for ( guard = 0; guard < mobaNumHeroes &&
+				( mobaHeroBanned[heroId] || MOBA_HeroTaken( heroId ) ); guard++ )
+			{
+				heroId = ( heroId + 1 ) % mobaNumHeroes;
+			}
 		}
 
 		mobaPlayers[i].heroId = heroId;
-
-		if ( ent->inuse && ent->client )
-		{
-			MOBA_LogLine( va( "%s plays %s", ent->client->pers.netname,
-				mobaHeroes[heroId].name ), ent );
-		}
+		MOBA_LogLine( va( "%s plays %s", ent->client->pers.netname,
+			mobaHeroes[heroId].name ), ent );
 	}
 }
 
@@ -247,6 +657,67 @@ static void MOBA_EnsureTeams( void )
 			SetTeamQuick( ent, PickTeam( i ), qfalse );
 		}
 	}
+}
+
+// The draft and the round logic both need a player on each side. Balancing on
+// connect can still leave everybody on one team, so the last player of the full
+// team is moved over instead of waiting for a team that will never fill itself.
+static void MOBA_BalanceTeams( void )
+{
+	team_t from, to;
+	int i;
+
+	if ( MOBA_TeamHasPlayer( TEAM_RED ) && MOBA_TeamHasPlayer( TEAM_BLUE ) )
+	{
+		return;
+	}
+
+	if ( MOBA_TeamHasPlayer( TEAM_RED ) )
+	{
+		from = TEAM_RED;
+		to = TEAM_BLUE;
+	}
+	else
+	{
+		from = TEAM_BLUE;
+		to = TEAM_RED;
+	}
+
+	// a lone player is not moved anywhere, the lobby waits for a second one
+	if ( MOBA_TeamSize( from ) < 2 )
+	{
+		return;
+	}
+
+	for ( i = level.maxclients - 1; i >= 0; i-- )
+	{
+		gentity_t *ent = &g_entities[i];
+
+		if ( MOBA_SlotActive( i ) && ent->client->sess.sessionTeam == from )
+		{
+			SetTeamQuick( ent, to, qfalse );
+			MOBA_LogLine( va( "%s moved to the %s team to fill it up",
+				ent->client->pers.netname, to == TEAM_RED ? "red" : "blue" ), ent );
+			return;
+		}
+	}
+}
+
+// True when no connected player is left without a hero, which ends the assign
+// stage before the clock runs out.
+static qboolean MOBA_EveryoneHasHero( void )
+{
+	int i;
+
+	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+	{
+		if ( MOBA_SlotActive( i ) && mobaPlayers[i].heroId < 0 )
+		{
+			return qfalse;
+		}
+	}
+
+	return qtrue;
 }
 
 static void MOBA_RespawnEveryoneOnTeams( void )
@@ -317,17 +788,68 @@ static void MOBA_StartLobby( void )
 {
 	mobaPhase = MOBA_PHASE_LOBBY;
 	mobaPhaseEnd = 0;
-	MOBA_CPAll( "^2Magic Wands^7 - waiting for players (2+)\n" );
+	MOBA_CPAll( "^2Magic Wands^7 - waiting for players on both teams (2+)\n" );
 }
 
 static void MOBA_StartDraft( void )
 {
 	mobaPhase = MOBA_PHASE_DRAFT;
-	mobaPhaseEnd = level.time + moba_pickTime.integer * 1000;
 
 	MOBA_EnsureTeams();
-	MOBA_CPAll( "^3Hero select phase!^7  !heroes - list, !pick N - choose (%i sec)\n",
-		moba_pickTime.integer );
+	MOBA_BalanceTeams();
+
+	// a single player has nobody to draft against, the lobby keeps waiting
+	if ( !MOBA_TeamHasPlayer( TEAM_RED ) || !MOBA_TeamHasPlayer( TEAM_BLUE ) )
+	{
+		mobaPhase = MOBA_PHASE_LOBBY;
+		return;
+	}
+
+	// a draft that was interrupted before it finished starts over, the heroes
+	// of the previous attempt are meaningless
+	MOBA_ResetHeroPool();
+
+	mobaCaptain[0] = MOBA_ElectCaptain( TEAM_RED );
+	mobaCaptain[1] = MOBA_ElectCaptain( TEAM_BLUE );
+
+	MOBA_BuildDraftPlan();
+
+	if ( mobaDraftPlanLen <= 0 )
+	{
+		MOBA_StartAssign();
+		return;
+	}
+
+	mobaPhaseEnd = level.time + moba_pickTime.integer * 1000;
+
+	MOBA_CPAll( "^3Hero draft!^7 %i steps, %i sec each - the captains ban and pick\n",
+		mobaDraftPlanLen, moba_pickTime.integer );
+	MOBA_DraftPrompt();
+}
+
+// Every player of a team takes one hero out of the pool his captain picked. The
+// stage ends as soon as nobody is left without a hero, so a quick team does not
+// wait out the clock.
+static void MOBA_StartAssign( void )
+{
+	int i, missing = 0;
+
+	// the lineup of the match is fixed from here on, the later rounds reuse it
+	mobaDraftDone = qtrue;
+
+	mobaPhase = MOBA_PHASE_DRAFT_ASSIGN;
+	mobaPhaseEnd = level.time + moba_pickTime.integer * 1000;
+
+	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+	{
+		if ( MOBA_SlotActive( i ) && mobaPlayers[i].heroId < 0 )
+		{
+			missing++;
+		}
+	}
+
+	MOBA_CPAll( "^3Hero assign!^7 %i player(s) still need a hero: ^3!pick N^7 - "
+		"!heroes lists the pool of your team (%i s)\n", missing, moba_pickTime.integer );
 }
 
 static void MOBA_StartBuy( void )
@@ -441,6 +963,11 @@ void MOBA_InitGame( void )
 {
 	MOBA_LoadHeroes();
 	MOBA_ResetPlayers();
+	MOBA_ResetHeroPool();
+
+	mobaDraftDone = qfalse;
+	mobaDraftFirst = 0;
+	mobaAutoDraftNext = 0;
 	mobaRound = 0;
 	mobaPhase = MOBA_PHASE_LOBBY;
 	mobaPhaseEnd = 0;
@@ -469,6 +996,22 @@ void MOBA_InitGame( void )
 // mod on a headless server where no real client can type chat commands.
 //=========================================================================
 
+// Resolves every draft step with a random hero instead of waiting out the clock,
+// so a full ban/pick plan can be verified on a dedicated server. It also makes
+// the captain election prefer a human, which is what allows the draft to be
+// driven by hand while the bots hold the other captain jobs.
+static void MOBA_RunAutoDraft( void )
+{
+	if ( !moba_autodraft.integer || mobaPhase != MOBA_PHASE_DRAFT ||
+		mobaDraftStep >= mobaDraftPlanLen || level.time < mobaAutoDraftNext )
+	{
+		return;
+	}
+
+	mobaAutoDraftNext = level.time + moba_autodraftEvery.integer;
+	MOBA_DraftCommit( -1, "auto" );
+}
+
 // Replays chat commands for every connected player, cycling through a '|'
 // separated list once per interval, so the '!' parser can be tested with bots
 // only: +set moba_auto "!pick 3|!buy 1|!1"
@@ -482,9 +1025,10 @@ static void MOBA_RunAutoCommand( void )
 		return;
 	}
 
-	// '!' commands are spread over the draft, buy and fight phases
-	if ( mobaPhase != MOBA_PHASE_DRAFT && mobaPhase != MOBA_PHASE_BUY &&
-		mobaPhase != MOBA_PHASE_FIGHT )
+	// '!' commands are spread over the draft, the assign stage, the buy and the
+	// fight phase
+	if ( mobaPhase != MOBA_PHASE_DRAFT && mobaPhase != MOBA_PHASE_DRAFT_ASSIGN &&
+		mobaPhase != MOBA_PHASE_BUY && mobaPhase != MOBA_PHASE_FIGHT )
 	{
 		return;
 	}
@@ -859,6 +1403,7 @@ void MOBA_RunFrame( void )
 	MOBA_HoldDeadPlayers();
 	MOBA_RunTestBots();
 	MOBA_RunAutoCommand();
+	MOBA_RunAutoDraft();
 	MOBA_RunTestKill();
 	MOBA_RunTestKick();
 
@@ -872,22 +1417,44 @@ void MOBA_RunFrame( void )
 	case MOBA_PHASE_LOBBY:
 		if ( level.numConnectedClients >= 2 )
 		{
-			MOBA_StartDraft();
-		}
-		break;
-
-	case MOBA_PHASE_DRAFT:
-		if ( level.time >= mobaPhaseEnd )
-		{
-			if ( MOBA_TeamHasPlayer( TEAM_RED ) && MOBA_TeamHasPlayer( TEAM_BLUE ) )
+			// the draft runs once per match, every later round goes straight to
+			// the shop with the lineup of the first one
+			if ( mobaDraftDone )
 			{
 				MOBA_StartBuy();
 			}
 			else
 			{
-				MOBA_CPAll( "^3Waiting for players to start the round...\n" );
 				MOBA_StartDraft();
 			}
+		}
+		break;
+
+	case MOBA_PHASE_DRAFT:
+		// a client that joins in the middle of the draft still has to end up on
+		// a team, it is too late for its captain job but not for the match
+		MOBA_EnsureTeams();
+		if ( level.time >= mobaPhaseEnd )
+		{
+			if ( mobaDraftStep >= mobaDraftPlanLen )
+			{
+				MOBA_StartAssign();
+			}
+			else
+			{
+				// a captain that did not act in time costs the step a random
+				// hero and the job goes to somebody else of the team
+				MOBA_TransferCaptain( mobaDraftActor[mobaDraftStep], "no answer" );
+				MOBA_DraftCommit( -1, "timeout" );
+			}
+		}
+		break;
+
+	case MOBA_PHASE_DRAFT_ASSIGN:
+		MOBA_EnsureTeams();
+		if ( level.time >= mobaPhaseEnd || MOBA_EveryoneHasHero() )
+		{
+			MOBA_StartBuy();
 		}
 		break;
 
@@ -900,8 +1467,9 @@ void MOBA_RunFrame( void )
 			}
 			else
 			{
-				MOBA_CPAll( "^3Not enough players - back to hero select.\n" );
-				MOBA_StartDraft();
+				// no re-draft: the lineup of the match stays, the round waits
+				// for players to show up
+				MOBA_StartLobby();
 			}
 		}
 		break;
@@ -913,7 +1481,7 @@ void MOBA_RunFrame( void )
 			if ( mobaRedPlayers == 0 || mobaBluePlayers == 0 )
 			{
 				MOBA_CPAll( "^3Team is empty - waiting for players.\n" );
-				MOBA_StartDraft();
+				MOBA_StartLobby();
 			}
 			else
 			{
@@ -931,7 +1499,7 @@ void MOBA_RunFrame( void )
 			}
 			else
 			{
-				MOBA_StartDraft();
+				MOBA_StartLobby();
 			}
 		}
 		break;
@@ -1141,7 +1709,8 @@ void MOBA_OnClientSpawn( gentity_t *ent )
 	if ( !mobaPlayers[ent->s.number].greeted )
 	{
 		mobaPlayers[ent->s.number].greeted = qtrue;
-		MOBA_CPSelf( ent, "^3Magic Wands^7: !pick N - hero,\n"
+		MOBA_CPSelf( ent, "^3Magic Wands^7: !heroes - hero list,\n"
+			"^3!pick N^7 - hero, ^3!ban N^7 - draft ban,\n"
 			"^3B^7 - open the shop panel in the buy phase,\n"
 			"^3G H J N X ;^7 - buy an item, ^3B^7 - close it,\n"
 			"!buy N|code - buy, !buyall - buy everything affordable,\n"
@@ -1161,6 +1730,17 @@ void MOBA_OnClientDisconnect( gentity_t *ent )
 	// player silently resumes the previous run instead of starting clean.
 	if ( mobaEnabled && ent->s.number >= 0 && ent->s.number < MAX_CLIENTS )
 	{
+		team_t team = ent->client->sess.sessionTeam;
+
+		// a captain that leaves mid draft hands the job over, otherwise the
+		// team would lose its turn and eat a random hero on the clock
+		if ( ( team == TEAM_RED || team == TEAM_BLUE ) &&
+			mobaCaptain[MOBA_TeamSeat( team )] == ent->s.number &&
+			mobaPhase == MOBA_PHASE_DRAFT )
+		{
+			MOBA_TransferCaptain( MOBA_TeamSeat( team ), "captain left" );
+		}
+
 		memset( &mobaPlayers[ent->s.number], 0, sizeof( mobaPlayers[ent->s.number] ) );
 		mobaPlayers[ent->s.number].heroId = -1;
 		mobaPlayers[ent->s.number].autoCmdNext = 0;
@@ -1542,14 +2122,51 @@ static void MOBA_CastAbility( gentity_t *ent, int slot )
 // Chat commands (players type !command)
 //=========================================================================
 
+// In the captain stage the whole pool is listed with its state, in the assign
+// stage only the heroes the captain picked for the team of the reader, numbered
+// the way !pick expects them.
 static void MOBA_ListHeroes( gentity_t *ent )
 {
-	int i;
+	int i, pool[MOBA_MAX_HEROES], count, j;
+	team_t team;
+
+	if ( mobaPhase == MOBA_PHASE_DRAFT_ASSIGN &&
+		( ent->client->sess.sessionTeam == TEAM_RED ||
+			ent->client->sess.sessionTeam == TEAM_BLUE ) )
+	{
+		team = ent->client->sess.sessionTeam;
+		count = MOBA_TeamPool( team, pool, ARRAY_LEN( pool ) );
+
+		MOBA_Self( ent, "^3Heroes your captain picked:" );
+		for ( j = 0; j < count; j++ )
+		{
+			MOBA_Self( ent, "^3%2i^7 - %s (^5%s^7)%s",
+				j + 1, mobaHeroes[pool[j]].name, mobaHeroes[pool[j]].role,
+				MOBA_HeroTaken( pool[j] ) ? " ^8(taken)^7" : "" );
+		}
+		MOBA_Self( ent, "^3!pick N^7 takes one of them for you" );
+		return;
+	}
 
 	for ( i = 0; i < mobaNumHeroes; i++ )
 	{
-		MOBA_Self( ent, "^3%2i^7 - %s (^5%s^7)",
-			i + 1, mobaHeroes[i].name, mobaHeroes[i].role );
+		const char *state = "";
+
+		if ( mobaHeroBanned[i] )
+		{
+			state = " ^8(banned)^7";
+		}
+		else if ( mobaHeroTeam[i] == TEAM_RED )
+		{
+			state = " ^1(red)^7";
+		}
+		else if ( mobaHeroTeam[i] == TEAM_BLUE )
+		{
+			state = " ^4(blue)^7";
+		}
+
+		MOBA_Self( ent, "^3%2i^7 - %s (^5%s^7)%s",
+			i + 1, mobaHeroes[i].name, mobaHeroes[i].role, state );
 	}
 }
 
@@ -1796,6 +2413,158 @@ static void MOBA_ShowStatus( gentity_t *ent )
 	}
 }
 
+//=========================================================================
+// Draft commands
+//=========================================================================
+
+// The captain stage works on the full hero list, the assign stage on the pool of
+// the team, so the number the player typed has to be mapped through the pool
+// before it becomes a hero id.
+static qboolean MOBA_DraftHeroFromArg( gentity_t *ent, const char *arg, int *heroId )
+{
+	int id, pool[MOBA_MAX_HEROES], count;
+
+	if ( arg == NULL || arg[0] == '\0' )
+	{
+		MOBA_CPSelf( ent, "Which hero? See: !heroes\n" );
+		return qfalse;
+	}
+
+	id = atoi( arg ) - 1;
+
+	if ( mobaPhase != MOBA_PHASE_DRAFT_ASSIGN )
+	{
+		// "!pick 0" and a mistyped word both arrive here as -1, the pool arrays
+		// are indexed with the result
+		if ( id < 0 || id >= mobaNumHeroes )
+		{
+			MOBA_CPSelf( ent, "Bad hero number! See: !heroes\n" );
+			return qfalse;
+		}
+
+		*heroId = id;
+		return qtrue;
+	}
+
+	if ( ent->client->sess.sessionTeam != TEAM_RED &&
+		ent->client->sess.sessionTeam != TEAM_BLUE )
+	{
+		MOBA_CPSelf( ent, "You are not playing this match.\n" );
+		return qfalse;
+	}
+
+	count = MOBA_TeamPool( ent->client->sess.sessionTeam, pool, ARRAY_LEN( pool ) );
+	if ( id < 0 || id >= count )
+	{
+		MOBA_CPSelf( ent, "Bad number! See: !heroes\n" );
+		return qfalse;
+	}
+
+	*heroId = pool[id];
+	return qtrue;
+}
+
+static void MOBA_DraftPick( gentity_t *ent, const char *arg )
+{
+	int heroId;
+
+	if ( mobaPhase != MOBA_PHASE_DRAFT && mobaPhase != MOBA_PHASE_DRAFT_ASSIGN )
+	{
+		MOBA_CPSelf( ent, "Heroes can only be picked in the draft!\n" );
+		return;
+	}
+
+	if ( mobaPhase == MOBA_PHASE_DRAFT && !MOBA_IsActingCaptain( ent ) )
+	{
+		MOBA_CPSelf( ent, "Not your turn - only the captains ban and pick.\n" );
+		return;
+	}
+
+	if ( mobaPlayers[ent->s.number].heroId >= 0 )
+	{
+		MOBA_CPSelf( ent, "You already have a hero!\n" );
+		return;
+	}
+
+	if ( !MOBA_DraftHeroFromArg( ent, arg, &heroId ) )
+	{
+		return;
+	}
+
+	if ( mobaPhase == MOBA_PHASE_DRAFT )
+	{
+		if ( mobaDraftPlan[mobaDraftStep] != MOBA_DRAFT_PICK )
+		{
+			MOBA_CPSelf( ent, "This turn is a ban - use ^3!ban N^7\n" );
+			return;
+		}
+
+		if ( !MOBA_DraftCommit( heroId, "chosen" ) )
+		{
+			MOBA_CPSelf( ent, "%s is not available! See: !heroes\n",
+				mobaHeroes[heroId].name );
+		}
+		return;
+	}
+
+	// assign stage: taking a hero of the pool of the team
+	if ( mobaHeroBanned[heroId] || mobaHeroTeam[heroId] != ent->client->sess.sessionTeam )
+	{
+		MOBA_CPSelf( ent, "%s is not in the pool of your team! See: !heroes\n",
+			mobaHeroes[heroId].name );
+		return;
+	}
+
+	if ( MOBA_HeroTaken( heroId ) )
+	{
+		MOBA_CPSelf( ent, "%s is already taken!\n", mobaHeroes[heroId].name );
+		return;
+	}
+
+	mobaPlayers[ent->s.number].heroId = heroId;
+	MOBA_CPSelf( ent, "Hero picked: ^5%s^7!\n", mobaHeroes[heroId].name );
+	MOBA_LogLine( va( "%s plays %s", ent->client->pers.netname,
+		mobaHeroes[heroId].name ), ent );
+
+	if ( MOBA_EveryoneHasHero() )
+	{
+		MOBA_CPAll( "^2Lineup complete^7 - to the shop\n" );
+	}
+}
+
+static void MOBA_DraftBan( gentity_t *ent, const char *arg )
+{
+	int heroId;
+
+	if ( mobaPhase != MOBA_PHASE_DRAFT )
+	{
+		MOBA_CPSelf( ent, "Heroes are only banned in the draft!\n" );
+		return;
+	}
+
+	if ( !MOBA_IsActingCaptain( ent ) )
+	{
+		MOBA_CPSelf( ent, "Not your turn - only the captains ban and pick.\n" );
+		return;
+	}
+
+	if ( mobaDraftPlan[mobaDraftStep] != MOBA_DRAFT_BAN )
+	{
+		MOBA_CPSelf( ent, "This turn is a pick - use ^3!pick N^7\n" );
+		return;
+	}
+
+	if ( !MOBA_DraftHeroFromArg( ent, arg, &heroId ) )
+	{
+		return;
+	}
+
+	if ( !MOBA_DraftCommit( heroId, "chosen" ) )
+	{
+		MOBA_CPSelf( ent, "%s is not available! See: !heroes\n", mobaHeroes[heroId].name );
+	}
+}
+
 qboolean MOBA_HandleChat( gentity_t *ent, const char *msg )
 {
 	char cmd[64], arg1[64];
@@ -1828,8 +2597,10 @@ qboolean MOBA_HandleChat( gentity_t *ent, const char *msg )
 
 	if ( !Q_stricmp( cmd, "!help" ) )
 	{
-		MOBA_Self( ent, "^3Commands:^7 !heroes !pick N !buy N|code !buyall !upgrade N !buyback "
-			"!1-!4 (abilities) !status\n"
+		MOBA_Self( ent, "^3Commands:^7 !heroes !pick N !ban N !buy N|code !buyall !upgrade N "
+			"!buyback !1-!4 (abilities) !status\n"
+			"^3Draft:^7 the two captains get !ban N and !pick N, everybody takes one "
+			"hero out of the pool of his team afterwards\n"
 			"^3The shop is the on screen panel:^7 press ^3B^7 in the buy phase, "
 			"^3G H J N X ;^7 buys an item, ^3B^7 closes it" );
 		return qtrue;
@@ -1857,37 +2628,13 @@ qboolean MOBA_HandleChat( gentity_t *ent, const char *msg )
 
 	if ( !Q_stricmp( cmd, "!pick" ) )
 	{
-		if ( mobaPhase != MOBA_PHASE_DRAFT )
-		{
-			MOBA_CPSelf( ent, "Heroes can only be picked in the draft phase!\n" );
-			return qtrue;
-		}
-		if ( mobaPlayers[ent->s.number].heroId >= 0 )
-		{
-			MOBA_CPSelf( ent, "Hero already picked!\n" );
-			return qtrue;
-		}
+		MOBA_DraftPick( ent, arg1 );
+		return qtrue;
+	}
 
-		{
-			int id = atoi( arg1 ) - 1;
-			if ( id < 0 || id >= mobaNumHeroes )
-			{
-				MOBA_CPSelf( ent, "Bad hero number! See: !heroes\n" );
-				return qtrue;
-			}
-
-			// one hero per player, a shared hero would stack two players' worth of
-			// bonuses on one body and leave the enemy team one hero short
-			if ( MOBA_HeroTaken( id ) )
-			{
-				MOBA_CPSelf( ent, "%s is already taken! See: !heroes\n",
-					mobaHeroes[id].name );
-				return qtrue;
-			}
-
-			mobaPlayers[ent->s.number].heroId = id;
-			MOBA_CPSelf( ent, "Hero picked: ^5%s^7!\n", mobaHeroes[id].name );
-		}
+	if ( !Q_stricmp( cmd, "!ban" ) )
+	{
+		MOBA_DraftBan( ent, arg1 );
 		return qtrue;
 	}
 
