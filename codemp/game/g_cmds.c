@@ -23,6 +23,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "g_local.h"
+#include "g_moba.h"
 #include "bg_saga.h"
 
 #include "ui/menudef.h"			// for the voice chats
@@ -1660,6 +1661,11 @@ static void Cmd_Say_f( gentity_t *ent ) {
 	if ( strlen( p ) >= MAX_SAY_TEXT ) {
 		p[MAX_SAY_TEXT-1] = '\0';
 		G_SecurityLogPrintf( "Cmd_Say_f from %d (%s) has been truncated: %s\n", ent->s.number, ent->client->pers.netname, p );
+	}
+
+	// magic_wands MOBA mod: '!' commands
+	if ( MOBA_HandleChat( ent, p ) ) {
+		return;
 	}
 
 	G_Say( ent, NULL, SAY_ALL, p );

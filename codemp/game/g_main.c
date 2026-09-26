@@ -25,6 +25,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 #include "g_local.h"
 #include "g_ICARUScb.h"
+#include "g_moba.h"
 #include "g_nav.h"
 #include "bg_saga.h"
 #include "b_local.h"
@@ -433,6 +434,8 @@ void G_InitGame( int levelTime, int randomSeed, int restart ) {
 			SP_info_jedimaster_start( ent );
 		}
 	}
+
+	MOBA_InitGame();
 }
 
 
@@ -3444,6 +3447,8 @@ void G_RunFrame( int levelTime ) {
 #endif
 
 	g_LastFrameTime = level.time;
+
+	MOBA_RunFrame();
 }
 
 const char *G_GetStringEdString(char *refSection, char *refName)

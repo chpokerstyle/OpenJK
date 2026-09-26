@@ -61,6 +61,7 @@ set(MPGameGameFiles
 	"${MPDir}/game/g_mem.c"
 	"${MPDir}/game/g_misc.c"
 	"${MPDir}/game/g_missile.c"
+	"${MPDir}/game/g_moba.c"
 	"${MPDir}/game/g_mover.c"
 	"${MPDir}/game/g_nav.c"
 	"${MPDir}/game/g_navnew.c"
@@ -130,6 +131,7 @@ set(MPGameGameFiles
 	"${MPDir}/game/chars.h"
 	"${MPDir}/game/g_ICARUScb.h"
 	"${MPDir}/game/g_local.h"
+	"${MPDir}/game/g_moba.h"
 	"${MPDir}/game/g_nav.h"
 	"${MPDir}/game/g_public.h"
 	"${MPDir}/game/g_team.h"
@@ -250,6 +252,11 @@ set_target_properties(${MPGame} PROPERTIES COMPILE_DEFINITIONS "${MPGameDefines}
 
 # Hide symbols not explicitly marked public.
 set_property(TARGET ${MPGame} APPEND PROPERTY COMPILE_OPTIONS ${OPENJK_VISIBILITY_FLAGS})
+
+if(MSVC)
+	# magic_wands: g_moba.c contains UTF-8 (Cyrillic) text
+	set_property(TARGET ${MPGame} APPEND PROPERTY COMPILE_OPTIONS "/utf-8")
+endif()
 
 set_target_properties(${MPGame} PROPERTIES INCLUDE_DIRECTORIES "${MPGameIncludeDirectories}")
 set_target_properties(${MPGame} PROPERTIES PROJECT_LABEL "MP Game Library")

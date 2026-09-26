@@ -24,6 +24,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 #include "g_local.h"
 #include "ghoul2/G2.h"
+#include "g_moba.h"
 #include "bg_saga.h"
 
 // g_client.c -- client functions that don't happen every frame
@@ -3192,7 +3193,11 @@ void ClientSpawn(gentity_t *ent) {
 	// find a spawn point
 	// do it before setting health back up, so farthest
 	// ranging doesn't count this client
-	if ( client->sess.sessionTeam == TEAM_SPECTATOR ) {
+	if ( MOBA_Active() )
+	{ //magic_wands MOBA mod: team based spawns
+		MOBA_PickSpawnPoint( ent, spawn_origin, spawn_angles );
+	}
+	else if ( client->sess.sessionTeam == TEAM_SPECTATOR ) {
 		spawnPoint = SelectSpectatorSpawnPoint (
 						spawn_origin, spawn_angles);
 	} else if (level.gametype == GT_CTF || level.gametype == GT_CTY) {
@@ -3728,6 +3733,13 @@ void ClientSpawn(gentity_t *ent) {
 		client->ps.stats[STAT_ARMOR] = client->ps.stats[STAT_MAX_HEALTH] * 0.25;
 	}
 
+	// magic_wands MOBA mod: override health/armor with hero stats
+	MOBA_OnClientSpawn( ent );
+	if ( MOBA_Active() && mobaPlayers[ent->s.number].heroId >= 0 )
+	{
+		ent->health = client->ps.stats[STAT_HEALTH];
+	}
+
 	G_SetOrigin( ent, spawn_origin );
 	VectorCopy( spawn_origin, client->ps.origin );
 
@@ -3965,6 +3977,9 @@ void ClientDisconnect( int clientNum ) {
 	}
 
 	G_LogPrintf( "ClientDisconnect: %i [%s] (%s) \"%s^7\"\n", clientNum, ent->client->sess.IP, ent->client->pers.guid, ent->client->pers.netname );
+
+	// magic_wands MOBA mod: drop the round state of the leaving player
+	MOBA_OnClientDisconnect( ent );
 
 	// if we are playing in tourney mode, give a win to the other player and clear his frags for this round
 	if ( level.gametype == GT_DUEL && !level.intermissiontime && !level.warmupTime ) {

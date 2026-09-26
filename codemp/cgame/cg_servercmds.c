@@ -27,6 +27,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 // be a valid snapshot this frame
 
 #include "cg_local.h"
+#include "cg_moba.h"
 #include "game/bg_public.h"
 #include "ui/menudef.h"
 #include "ghoul2/G2.h"
@@ -1613,6 +1614,7 @@ static serverCommand_t	commands[] = {
 	{ "loaddefered",		CG_LoadDeferredPlayers }, // FIXME: spelled wrong, but not changing for demo
 	{ "ltchat",				CG_Chat_f },
 	{ "map_restart",		CG_MapRestart },
+	{ "mobaShop",			CG_Moba_ServerCommand_f },
 	{ "nfr",				CG_NewForceRank_f },
 	{ "print",				CG_Print_f },
 	{ "rcg",				CG_RestoreClientGhoul_f },

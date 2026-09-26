@@ -25,6 +25,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 #include "b_local.h"
 #include "bg_saga.h"
+#include "g_moba.h"
 
 extern int G_ShipSurfaceForSurfName( const char *surfaceName );
 extern qboolean G_FlyVehicleDestroySurface( gentity_t *veh, int surface );
@@ -808,7 +809,8 @@ char	*modNames[MOD_MAX] = {
 	"MOD_FALLING",
 	"MOD_SUICIDE",
 	"MOD_TARGET_LASER",
-	"MOD_TRIGGER_HURT"
+	"MOD_TRIGGER_HURT",
+	"MOD_MOBA"
 };
 
 
@@ -2433,6 +2435,9 @@ extern void RunEmplacedWeapon( gentity_t *ent, usercmd_t **ucmd );
 
 	self->client->ps.pm_type = PM_DEAD;
 	self->client->ps.pm_flags &= ~PMF_STUCK_TO_WALL;
+
+	// magic_wands MOBA mod: gold/xp on kill, no auto respawn during a round
+	MOBA_OnPlayerDeath( self, attacker, meansOfDeath );
 
 	if ( attacker ) {
 		killer = attacker->s.number;
@@ -4435,6 +4440,13 @@ void G_Damage( gentity_t *targ, gentity_t *inflictor, gentity_t *attacker, vec3_
 		G_Damage(&g_entities[targ->damageRedirectTo], inflictor, attacker, dir, point, damage, dflags, mod);
 		return;
 	}
+
+	// magic_wands MOBA mod
+	if ( MOBA_ShouldBlockDamage( targ, attacker ) )
+	{
+		return;
+	}
+	damage = MOBA_AdjustDamage( targ, attacker, damage );
 
 	if (mod == MOD_DEMP2 && targ && targ->inuse && targ->client)
 	{

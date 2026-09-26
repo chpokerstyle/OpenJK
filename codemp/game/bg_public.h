@@ -1152,6 +1152,7 @@ typedef enum {
 	//make sure he actually lost points, there may be cases where you don't lose points on changing teams
 	//or suiciding, and so you would actually be giving him a point) -Rich
 	// I put it back in for now, if it becomes a problem we'll work around it later (it shouldn't though)...
+	MOD_MOBA,				// magic_wands MOBA mod - ability damage
 	MOD_MAX
 } meansOfDeath_t;
 

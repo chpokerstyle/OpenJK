@@ -26,6 +26,8 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 #include "cg_local.h"
 
+#include "cg_moba.h"
+
 #include "game/bg_saga.h"
 
 #include "ui/ui_shared.h"
@@ -8339,6 +8341,8 @@ static void CG_Draw2D( void ) {
 	if ( !cg.scoreBoardShowing) {
 		CG_DrawCenterString();
 	}
+
+	CG_Moba_Draw();
 
 	// always draw chat
 	CG_ChatBox_DrawStrings();
