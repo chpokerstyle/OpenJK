@@ -261,20 +261,6 @@ static void MOBA_StartDraft( void )
 		moba_pickTime.integer );
 }
 
-//=========================================================================
-// Menu cursors are only meaningful inside the buy phase, so drop them when the
-// round starts instead of leaving a stale highlight behind.
-//=========================================================================
-static void MOBA_CloseShopMenus( void )
-{
-	int i;
-
-	for ( i = 0; i < MAX_CLIENTS; i++ )
-	{
-		mobaPlayers[i].shopCursor = -1;
-	}
-}
-
 static void MOBA_StartBuy( void )
 {
 	mobaPhase = MOBA_PHASE_BUY;
@@ -306,7 +292,7 @@ static void MOBA_StartBuy( void )
 		}
 	}
 
-	MOBA_CPAll( "^3Buy phase:^7 %i sec  !shop / !buy N / !upgrade N\n",
+	MOBA_CPAll( "^3Buy phase:^7 %i sec  press ^3B^7 for the shop panel  !buy N  !upgrade N\n",
 		moba_buyTime.integer );
 }
 
@@ -316,7 +302,6 @@ static void MOBA_StartFight( void )
 
 	mobaPhase = MOBA_PHASE_FIGHT;
 	mobaPhaseEnd = 0;
-	MOBA_CloseShopMenus();
 
 	// make sure everyone has a hero
 	for ( i = 0; i < level.maxclients; i++ )
@@ -1055,11 +1040,12 @@ void MOBA_OnClientSpawn( gentity_t *ent )
 	if ( !mobaPlayers[ent->s.number].greeted )
 	{
 		mobaPlayers[ent->s.number].greeted = qtrue;
-		MOBA_CPSelf( ent, "^3Magic Wands^7: !pick N - hero, !shop - store,\n"
+		MOBA_CPSelf( ent, "^3Magic Wands^7: !pick N - hero,\n"
+			"^3B^7 - open the shop panel in the buy phase,\n"
+			"^3G H J N X ;^7 - buy an item, ^3B^7 - close it,\n"
 			"!buy N|code - buy, !buyall - buy everything affordable,\n"
-			"!n !p !close - shop menu, !upgrade N - upgrade ability,\n"
-			"!1-!4 - abilities, !buyback - return after death,\n"
-			"!status - stats, !help - all commands\n" );
+			"!upgrade N - upgrade ability, !1-!4 - abilities,\n"
+			"!buyback - return after death, !status - stats, !help - all commands\n" );
 	}
 }
 
@@ -1446,47 +1432,18 @@ static void MOBA_ListHeroes( gentity_t *ent )
 }
 
 //=========================================================================
-// Shop menu, laid out like the CS 1.6 buy menu: fixed item numbers that never
-// change, a short code for "!buy <code>", the category next to the price and
-// the gold of the player. The row under the cursor is prefixed with ">" so the
-// player can browse with !n / !p and confirm with a bare !buy.
-//=========================================================================
-static void MOBA_ShopMenu( gentity_t *ent )
-{
-	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
-	int i;
-
-	if ( p->shopCursor < 0 || p->shopCursor >= mobaNumItems )
-	{
-		p->shopCursor = 0;
-	}
-
-	MOBA_Self( ent, "^3+-- MAGIC WANDS SHOP -------------+^7" );
-	for ( i = 0; i < mobaNumItems; i++ )
-	{
-		MOBA_Self( ent, "%s^3%i^7 %-15s ^6%4i^7g %-5s %s%s",
-			( p->shopCursor == i ) ? "^1>^7 " : "  ",
-			i + 1, mobaItems[i].name, mobaItems[i].price, mobaItems[i].category,
-			mobaItems[i].desc,
-			( p->itemMask & ( 1 << i ) ) ? " ^1[bought]^7" : "" );
-	}
-	MOBA_Self( ent, "^3+-------------------------------------+^7" );
-	MOBA_Self( ent, "Gold: ^2%i^7  |  !buy ^3<number|^code>^7  !buyall  !n  !p  !close", p->gold );
-}
-
-//=========================================================================
-// Resolves a shop argument to an item index. A number is taken as the menu
-// number, anything else is matched against the short code of an item. An
-// empty argument selects the row under the cursor.
+// Resolves a shop argument to an item index. A number is taken as the item
+// number of the on screen panel, anything else is matched against the short
+// code of an item. An empty argument is a mistyped command, there is no text
+// menu left to carry a cursor.
 //=========================================================================
 static int MOBA_ResolveItem( gentity_t *ent, const char *arg )
 {
-	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
 	int i;
 
 	if ( arg == NULL || arg[0] == '\0' )
 	{
-		return p->shopCursor;
+		return -3;
 	}
 
 	if ( Q_isalpha( (unsigned char)arg[0] ) == 0 )
@@ -1564,9 +1521,15 @@ static void MOBA_BuyItem( gentity_t *ent, int id )
 		return;
 	}
 
+	if ( id == -3 )
+	{
+		MOBA_Self( ent, "^3Give an item number or code, for example !buy 1" );
+		return;
+	}
+
 	if ( id < 0 || id >= mobaNumItems )
 	{
-		MOBA_Self( ent, "^3Bad item number. Use 1-%i or !shop to see the menu", mobaNumItems );
+		MOBA_Self( ent, "^3Bad item number, the shop has 1-%i", mobaNumItems );
 		return;
 	}
 
@@ -1738,44 +1701,15 @@ qboolean MOBA_HandleChat( gentity_t *ent, const char *msg )
 
 	if ( !Q_stricmp( cmd, "!help" ) )
 	{
-		MOBA_Self( ent, "^3Commands:^7 !heroes !pick N !shop !buy N|code !buyall !n !p !close !upgrade N !buyback !1-!4 (abilities) !status" );
+		MOBA_Self( ent, "^3Commands:^7 !heroes !pick N !buy N|code !buyall !upgrade N !buyback "
+			"!1-!4 (abilities) !status\n"
+			"^3The shop is the on screen panel:^7 press ^3B^7 in the buy phase, "
+			"^3G H J N X ;^7 buys an item, ^3B^7 closes it" );
 		return qtrue;
 	}
 	if ( !Q_stricmp( cmd, "!heroes" ) )
 	{
 		MOBA_ListHeroes( ent );
-		return qtrue;
-	}
-	if ( !Q_stricmp( cmd, "!shop" ) || !Q_stricmp( cmd, "!menu" ) )
-	{
-		if ( mobaPhase != MOBA_PHASE_BUY )
-		{
-			MOBA_Self( ent, "^3The shop opens in the buy phase, right after the draft." );
-			return qtrue;
-		}
-		MOBA_ShopMenu( ent );
-		return qtrue;
-	}
-	if ( !Q_stricmp( cmd, "!close" ) )
-	{
-		mobaPlayers[ent->s.number].shopCursor = -1;
-		MOBA_Self( ent, "^3Shop closed." );
-		return qtrue;
-	}
-	if ( !Q_stricmp( cmd, "!n" ) || !Q_stricmp( cmd, "!next" ) )
-	{
-		mobaPlayer_t *p = &mobaPlayers[ent->s.number];
-
-		p->shopCursor = ( p->shopCursor + 1 ) % mobaNumItems;
-		MOBA_ShopMenu( ent );
-		return qtrue;
-	}
-	if ( !Q_stricmp( cmd, "!p" ) || !Q_stricmp( cmd, "!prev" ) )
-	{
-		mobaPlayer_t *p = &mobaPlayers[ent->s.number];
-
-		p->shopCursor = ( p->shopCursor <= 0 ) ? mobaNumItems - 1 : p->shopCursor - 1;
-		MOBA_ShopMenu( ent );
 		return qtrue;
 	}
 	if ( !Q_stricmp( cmd, "!buyall" ) )

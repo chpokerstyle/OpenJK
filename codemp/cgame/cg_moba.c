@@ -16,20 +16,26 @@ stays in sync with the authoritative game state without any guessing.
 //=========================================================================
 // Presentation copy of mobaItems from g_moba.c. The server stays the only
 // owner of the prices it actually charges, this table only has to render them.
+// The key column mirrors the binds in moba.cfg: the JKA client never hands key
+// codes to the cgame, so a bind writes a token into cg_mobaKey instead. The
+// keys are the ones the default JKA layout leaves free, digits and numpad stay
+// on weapons, movement and force powers.
 //=========================================================================
 typedef struct {
 	const char	*name;
 	int			price;
 	const char	*desc;
+	const char	*key;			// moba.cfg bind that buys this slot
+	vec4_t		chip;			// keycap colour, groups the items by kind
 } cgMobaItem_t;
 
 static const cgMobaItem_t cgMobaItems[] = {
-	{ "Sturdy Armor",	250,	"+50 armor" },
-	{ "Med Kit",		200,	"+100 health" },
-	{ "Rage Rune",		300,	"+20% damage" },
-	{ "Heavy Plate",	500,	"+100 armor, +50 health" },
-	{ "Power Crystal",	650,	"+50 health, +40% damage" },
-	{ "Shadow Cloak",	400,	"+30 armor, +15% damage" }
+	{ "Sturdy Armor",	250,	"+50 armor",					"G",	{ 0.30f, 0.50f, 0.80f, 0.95f } },
+	{ "Med Kit",		200,	"+100 health",				"H",	{ 0.75f, 0.25f, 0.25f, 0.95f } },
+	{ "Rage Rune",		300,	"+20% damage",				"J",	{ 0.85f, 0.45f, 0.15f, 0.95f } },
+	{ "Heavy Plate",	500,	"+100 armor, +50 health",		"N",	{ 0.25f, 0.45f, 0.70f, 0.95f } },
+	{ "Power Crystal",	650,	"+50 health, +40% damage",	"X",	{ 0.60f, 0.30f, 0.75f, 0.95f } },
+	{ "Shadow Cloak",	400,	"+30 armor, +15% damage",		";",	{ 0.25f, 0.60f, 0.40f, 0.95f } }
 };
 
 #define CG_MOBA_NUM_ITEMS	( (int)( sizeof( cgMobaItems ) / sizeof( cgMobaItems[0] ) ) )
@@ -139,8 +145,9 @@ static qboolean CG_Moba_ShopOpen( void )
 //   b  - open or close the shop
 //   1..6 - buy that slot and close the shop again
 //
-// Escape needs no token: the client opens the game menu on it and the binds
-// never run, so the panel is simply left alone and B brings it back.
+// Escape never reaches a bind: cl_keys.cpp handles it before CL_ParseBinding
+// and opens the game menu instead (that is also why no token can close the
+// panel from the client side). B closes it again.
 //=========================================================================
 static void CG_Moba_HandleToken( const char *token )
 {
@@ -166,16 +173,16 @@ static void CG_Moba_HandleToken( const char *token )
 			// the vm console command queue has no separator, so the newline has
 			// to be part of every command the cgame sends (cl_cgame.cpp
 			// Cbuf_AddText), otherwise it merges with the next one
-			trap->SendConsoleCommand( va( "say !buy %c\n", token[0] ) );
+			//
+			// "cmd say ..." instead of a plain "say ...": the client only
+			// forwards a console command to the server after the cgame, the ui
+			// and the cvar lookups have all declined it, and "cmd" skips that
+			// chain completely (cl_main.cpp CL_ForwardToServer_f)
+			trap->SendConsoleCommand( va( "cmd say !buy %c\n", token[0] ) );
 			cgMoba.open = qfalse;	// one item per shop opening
 		}
 
 		return;
-	}
-
-	if ( !Q_stricmp( token, "esc" ) )
-	{
-		cgMoba.open = qfalse;
 	}
 }
 
@@ -208,17 +215,22 @@ void CG_Moba_Draw( void )
 	static vec4_t colorBorder = { 0.6f, 0.5f, 0.2f, 0.9f };
 	static vec4_t colorTitle = { 1.0f, 0.85f, 0.3f, 1.0f };
 	static vec4_t colorPhase = { 0.7f, 0.7f, 0.7f, 1.0f };
+	static vec4_t colorUrgent = { 1.0f, 0.35f, 0.35f, 1.0f };
 	static vec4_t colorNormal = { 1.0f, 1.0f, 1.0f, 1.0f };
+	static vec4_t colorPoor = { 0.65f, 0.55f, 0.55f, 1.0f };
 	static vec4_t colorOwned = { 0.5f, 0.5f, 0.5f, 1.0f };
 	static vec4_t colorPrice = { 0.4f, 0.9f, 0.4f, 1.0f };
 	static vec4_t colorPriceOwned = { 0.35f, 0.5f, 0.35f, 1.0f };
+	static vec4_t colorPricePoor = { 0.95f, 0.3f, 0.3f, 1.0f };
 	static vec4_t colorBought = { 0.9f, 0.4f, 0.4f, 1.0f };
 	static vec4_t colorGold = { 1.0f, 0.85f, 0.25f, 1.0f };
 	static vec4_t colorHint = { 0.65f, 0.65f, 0.65f, 1.0f };
+	static vec4_t colorCap = { 1.0f, 1.0f, 1.0f, 1.0f };
 
-	const float panelWidth = 250.0f;
+	const float panelWidth = 272.0f;
 	const float rowHeight = 15.0f;
 	const float titleHeight = 18.0f;
+	const float keySize = 11.0f;
 	float x = 16.0f, y = 80.0f, w = panelWidth;
 	float panelHeight, textY, priceX, tagX;
 	int i, secondsLeft;
@@ -258,10 +270,28 @@ void CG_Moba_Draw( void )
 		secondsLeft = 0;
 	}
 
-	textY += titleHeight;
-	CG_Text_Paint( x + 8.0f, textY, 0.7f, colorPhase,
-		va( "Buy phase - %i s left - level %i", secondsLeft, cgMoba.level ), 0, 0,
-		ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	// the last seconds of the buy phase blink and turn red, a phase that runs
+	// out silently is the easiest way to lose a purchase
+	{
+		vec4_t phaseColor;
+		qboolean urgent = ( secondsLeft <= 5 ) ? qtrue : qfalse;
+		int c;
+
+		for ( c = 0; c < 4; c++ )
+		{
+			phaseColor[c] = urgent ? colorUrgent[c] : colorPhase[c];
+		}
+
+		if ( urgent )
+		{
+			phaseColor[3] = 0.35f + 0.65f * ( 0.5f + 0.5f * sin( cg.time * 0.009f ) );
+		}
+
+		textY += titleHeight;
+		CG_Text_Paint( x + 8.0f, textY, 0.7f, phaseColor,
+			va( "Buy phase - %i s left - level %i", secondsLeft, cgMoba.level ),
+			0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	}
 
 	textY += rowHeight;
 
@@ -271,24 +301,47 @@ void CG_Moba_Draw( void )
 
 	for ( i = 0; i < CG_MOBA_NUM_ITEMS; i++ )
 	{
-		qboolean owned = ( cgMoba.itemMask & ( 1 << i ) ) ? qtrue : qfalse;
 		const cgMobaItem_t *item = &cgMobaItems[i];
-		const char *label = va( "%i  %s", i + 1, item->name );
+		qboolean owned = ( cgMoba.itemMask & ( 1 << i ) ) ? qtrue : qfalse;
+		qboolean poor = ( !owned && item->price > cgMoba.gold ) ? qtrue : qfalse;
+		const char *label = item->name;
 		const char *price = va( "%ig", item->price );
 		float labelW = (float)CG_Text_Width( label, 0.7f, FONT_SMALL );
 		float priceW = (float)CG_Text_Width( price, 0.7f, FONT_SMALL );
-		float *rowColor = owned ? colorOwned : colorNormal;
+		float keyW = (float)CG_Text_Width( item->key, 0.7f, FONT_SMALL );
+		float *rowColor = owned ? colorOwned : ( poor ? colorPoor : colorNormal );
+		vec4_t chipColor;
+		int c;
 
-		if ( labelW + priceW + 60.0f > w )
+		for ( c = 0; c < 4; c++ )
+		{
+			chipColor[c] = item->chip[c];
+		}
+
+		if ( labelW + priceW + 76.0f > w )
 		{
 			continue;	// never let a longer name overlap the price column
 		}
 
-		CG_Text_Paint( x + 8.0f, textY, 0.7f, rowColor, label, 0, 0,
+		if ( owned )
+		{
+			chipColor[0] *= 0.35f;
+			chipColor[1] *= 0.35f;
+			chipColor[2] *= 0.35f;
+		}
+
+		// keycap: the coloured square is the item icon, the letter on it is
+		// the key that buys it, so the panel is readable without a manual
+		CG_FillRect( x + 6.0f, textY - 1.0f, keySize, keySize, chipColor );
+		CG_DrawRect( x + 6.0f, textY - 1.0f, keySize, keySize, 1.0f, colorBorder );
+		CG_Text_Paint( x + 6.0f + ( keySize - keyW ) * 0.5f, textY, 0.7f, colorCap,
+			item->key, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+
+		CG_Text_Paint( x + 6.0f + keySize + 5.0f, textY, 0.7f, rowColor, label, 0, 0,
 			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 		CG_Text_Paint( priceX - priceW, textY, 0.7f,
-			owned ? colorPriceOwned : colorPrice, price, 0, 0,
-			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+			owned ? colorPriceOwned : ( poor ? colorPricePoor : colorPrice ), price,
+			0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 
 		if ( owned )
 		{
@@ -302,9 +355,10 @@ void CG_Moba_Draw( void )
 		textY += rowHeight;
 	}
 
-	CG_Text_Paint( x + 8.0f, textY, 0.75f, colorGold,
+	CG_Text_Paint( x + 8.0f, textY, 0.75f,
+		( cgMoba.gold > 0 ) ? colorGold : colorUrgent,
 		va( "Gold: %i", cgMoba.gold ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_MEDIUM );
 
 	CG_Text_Paint( x + 8.0f, textY + rowHeight, 0.7f, colorHint,
-		"1-6 buy    B close", 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+		"buy G H J N X ;    B close", 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 }
