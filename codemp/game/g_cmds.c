@@ -514,6 +514,11 @@ void Cmd_TeamTask_f( gentity_t *ent ) {
 #endif
 
 void G_Kill( gentity_t *ent ) {
+	if (!MOBA_CanSuicide(ent))
+	{
+		return;
+	}
+
 	if ((level.gametype == GT_DUEL || level.gametype == GT_POWERDUEL) &&
 		level.numPlayingClients > 1 && !level.warmupTime)
 	{

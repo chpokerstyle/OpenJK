@@ -810,8 +810,16 @@ char	*modNames[MOD_MAX] = {
 	"MOD_SUICIDE",
 	"MOD_TARGET_LASER",
 	"MOD_TRIGGER_HURT",
+	"MOD_TEAM_CHANGE",
 	"MOD_MOBA"
 };
+
+// this table is indexed by meansOfDeath_t, a missing or extra entry here does
+// not fail anywhere else: it just mislabels the death and hands an
+// uninitialised string to g_log.c, which reads it for every MOD_MAX
+typedef char modNames_matches_meansOfDeath[
+	( sizeof(modNames)/sizeof(modNames[0]) == MOD_MAX ) ? 1 : -1
+];
 
 
 /*

@@ -75,7 +75,6 @@ typedef struct {
 	int					skillPoints;
 	int					abilityLevel[MOBA_ABILITIES_PER_HERO];
 	int					itemMask;		// bit per owned item
-	int					shopCursor;		// highlighted row while the shop menu is open, -1 = closed
 	int					cdReady[MOBA_ABILITIES_PER_HERO];	// absolute level.time when ability is ready
 	int					autoCmdNext;	// dev aid: level.time of the next moba_auto replay
 	int					autoCmdIdx;	// dev aid: cursor into the moba_auto command list
@@ -98,6 +97,7 @@ extern mobaPlayer_t		mobaPlayers[MAX_CLIENTS];
 void					MOBA_InitGame( void );			// g_main: G_InitGame
 void					MOBA_RunFrame( void );			// g_main: G_RunFrame (once per frame)
 qboolean				MOBA_Active( void );			// g_moba cvar is 1
+qboolean				MOBA_CanSuicide( gentity_t *ent );	// g_cmds: G_Kill
 qboolean				MOBA_ShouldBlockDamage( gentity_t *targ, gentity_t *attacker );
 int						MOBA_AdjustDamage( gentity_t *targ, gentity_t *attacker, int damage );
 void					MOBA_OnPlayerDeath( gentity_t *self, gentity_t *attacker, int meansOfDeath );

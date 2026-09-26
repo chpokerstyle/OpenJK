@@ -173,7 +173,9 @@ XCVAR_DEF( g_weaponDisable,				"0",			NULL,						CVAR_SERVERINFO|CVAR_ARCHIVE|CV
 XCVAR_DEF( g_weaponRespawn,				"5",			NULL,						CVAR_NONE,										qtrue )
 XCVAR_DEF( gamedate,					SOURCE_DATE,	NULL,						CVAR_ROM,										qfalse )
 XCVAR_DEF( gamename,					JK_VERSION,		NULL,						CVAR_SERVERINFO|CVAR_ROM,						qfalse )
-XCVAR_DEF( moba_log,					"1",			NULL,						CVAR_LATCH,										qtrue )
+// mirrors every player facing MOBA line into games.log, off by default: it is a
+// development aid for a headless server and pure log noise for a real match
+XCVAR_DEF( moba_log,					"0",			NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_startGold,			"1000",		NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_auto,					"",				NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_autoEvery,				"1500",			NULL,						CVAR_LATCH,										qtrue )

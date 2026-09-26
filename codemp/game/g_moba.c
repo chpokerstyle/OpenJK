@@ -16,6 +16,19 @@ static void MOBA_BuyItem( gentity_t *ent, int id );
 #define MOBA_DEFAULT_MAXHEALTH	500
 #define MOBA_DEFAULT_ARMOR		50
 
+// JKA armor is a shield pool that depletes as it eats damage (G_ApplyArmor),
+// not a mitigation percentage, so this is a shield point budget. It has to stay
+// above the strongest hero base armor (100) or the armor items are dead gold
+// for exactly the heroes that are supposed to buy them.
+#define MOBA_MAX_ARMOR			200
+#define MOBA_MAX_HEALTH			10000
+
+// gold and xp for a hero kill, the round win and round loss payouts are in
+// MOBA_StartRoundEnd
+#define MOBA_GOLD_KILL			300
+#define MOBA_XP_KILL_BASE		50
+#define MOBA_XP_KILL_PER_LEVEL	10
+
 #define MOBA_FALLBACK_RESPAWN	3600000	// 1h - effectively never (round-based respawn)
 
 static qboolean mobaEnabled = qfalse;
@@ -58,7 +71,6 @@ static void MOBA_ResetPlayers( void )
 	for ( i = 0; i < MAX_CLIENTS; i++ )
 	{
 		mobaPlayers[i].heroId = -1;
-		mobaPlayers[i].shopCursor = -1;
 	}
 }
 
@@ -141,6 +153,59 @@ static void MOBA_Self( gentity_t *ent, const char *fmt, ... )
 }
 
 
+//=========================================================================
+// Hero assignment
+//=========================================================================
+
+static qboolean MOBA_HeroTaken( int heroId )
+{
+	int i;
+
+	for ( i = 0; i < MAX_CLIENTS; i++ )
+	{
+		if ( mobaPlayers[i].inuse && mobaPlayers[i].heroId == heroId )
+		{
+			return qtrue;
+		}
+	}
+
+	return qfalse;
+}
+
+// Hands a free hero to every player that has none, so the draft falling through
+// on a timeout costs a choice and not the whole round. Must run before the
+// respawn of the buy phase, the stats are only applied on spawn.
+static void MOBA_FillMissingHeroes( void )
+{
+	int i, heroId, guard;
+
+	for ( i = 0; i < level.maxclients; i++ )
+	{
+		gentity_t *ent = &g_entities[i];
+
+		if ( !mobaPlayers[i].inuse || mobaPlayers[i].heroId >= 0 )
+		{
+			continue;
+		}
+
+		// start random and walk on until a free hero shows up, with fewer
+		// clients than heroes the walk always ends before the list runs out
+		heroId = Q_irand( 0, mobaNumHeroes - 1 );
+		for ( guard = 0; guard < mobaNumHeroes && MOBA_HeroTaken( heroId ); guard++ )
+		{
+			heroId = ( heroId + 1 ) % mobaNumHeroes;
+		}
+
+		mobaPlayers[i].heroId = heroId;
+
+		if ( ent->inuse && ent->client )
+		{
+			MOBA_LogLine( va( "%s plays %s", ent->client->pers.netname,
+				mobaHeroes[heroId].name ), ent );
+		}
+	}
+}
+
 static qboolean MOBA_TeamHasPlayer( team_t team )
 {
 	int i;
@@ -173,7 +238,11 @@ static void MOBA_EnsureTeams( void )
 			continue;
 		}
 
-		if ( ent->client->sess.sessionTeam == TEAM_FREE )
+		// everybody plays in MOBA, there is no spectator slot: a client that
+		// sits in TEAM_FREE or in the team menu would never count as a player
+		// and the round start waits for both teams, which deadlocked the draft
+		if ( ent->client->sess.sessionTeam != TEAM_RED &&
+			ent->client->sess.sessionTeam != TEAM_BLUE )
 		{
 			SetTeamQuick( ent, PickTeam( i ), qfalse );
 		}
@@ -267,6 +336,11 @@ static void MOBA_StartBuy( void )
 	mobaPhaseEnd = level.time + moba_buyTime.integer * 1000;
 
 	MOBA_EnsureTeams();
+
+	// a player who never used !pick still has to shop with a real hero, the
+	// placeholder stats have no abilities and are not what the shop prices
+	// were balanced against
+	MOBA_FillMissingHeroes();
 	MOBA_RespawnEveryoneOnTeams();
 
 	// Without a starting stash the shop is unusable in the first buy phase: gold
@@ -298,28 +372,12 @@ static void MOBA_StartBuy( void )
 
 static void MOBA_StartFight( void )
 {
-	int i;
-
 	mobaPhase = MOBA_PHASE_FIGHT;
 	mobaPhaseEnd = 0;
 
-	// make sure everyone has a hero
-	for ( i = 0; i < level.maxclients; i++ )
-	{
-		gentity_t *ent = &g_entities[i];
-
-		if ( mobaPlayers[i].inuse && mobaPlayers[i].heroId < 0 )
-		{
-			mobaPlayers[i].heroId = Q_irand( 0, mobaNumHeroes - 1 );
-
-			if ( ent->inuse && ent->client )
-			{
-				MOBA_LogLine( va( "%s plays %s", ent->client->pers.netname,
-					mobaHeroes[mobaPlayers[i].heroId].name ), ent );
-			}
-		}
-	}
-
+	// the buy phase assigned the heroes already, this only covers a fight that
+	// somehow starts without one
+	MOBA_FillMissingHeroes();
 	MOBA_RespawnEveryoneOnTeams();
 	MOBA_CPAll( "^1ROUND %i - FIGHT!^7\n", mobaRound + 1 );
 }
@@ -737,6 +795,13 @@ static void MOBA_RunTestBots( void )
 		va( "addbot \"%s\" 2\n", botNames[( issued - 1 ) % ARRAY_LEN( botNames )] ) );
 }
 
+// per slot memory of the last pushed state, kept next to the function so a
+// disconnect can clear it: a client that lands in a reused slot would
+// otherwise start with the previous occupant's state and never be told about
+// its gold or its item mask
+static char mobaLastSent[MAX_CLIENTS][64];
+static qboolean mobaShopStateLogged[MAX_CLIENTS];
+
 //=========================================================================
 // Pushes the shop state of a client to its own cgame with a server command:
 // "mobaShop phase seconds gold itemMask level". Server commands are used
@@ -748,7 +813,6 @@ static void MOBA_RunTestBots( void )
 static void MOBA_PushShopState( int clientNum )
 {
 	gentity_t *ent = &g_entities[clientNum];
-	static char lastSent[MAX_CLIENTS][64];
 	char buf[64];
 	int secs;
 
@@ -764,19 +828,17 @@ static void MOBA_PushShopState( int clientNum )
 		mobaPhase, secs, mobaPlayers[clientNum].gold,
 		mobaPlayers[clientNum].itemMask, mobaPlayers[clientNum].level );
 
-	if ( Q_stricmp( buf, lastSent[clientNum] ) != 0 )
+	if ( Q_stricmp( buf, mobaLastSent[clientNum] ) != 0 )
 	{
-		static qboolean logged[MAX_CLIENTS];
-
-		Q_strncpyz( lastSent[clientNum], buf, sizeof( lastSent[clientNum] ) );
+		Q_strncpyz( mobaLastSent[clientNum], buf, sizeof( mobaLastSent[clientNum] ) );
 		trap->SendServerCommand( ent->s.number, va( "mobaShop \"%s\"", buf ) );
 
 		// G_Printf must not be used here: the G_PRINT syscall of this engine
 		// kills the game module, so the mod logs through its own G_LogPrintf
 		// wrapper like every other MOBA line.
-		if ( !logged[clientNum] )
+		if ( !mobaShopStateLogged[clientNum] )
 		{
-			logged[clientNum] = qtrue;
+			mobaShopStateLogged[clientNum] = qtrue;
 			MOBA_LogLine( va( "shop state -> client %i: %s", clientNum, buf ), NULL );
 		}
 	}
@@ -882,6 +944,30 @@ qboolean MOBA_Active( void )
 }
 
 //=========================================================================
+// Suicide
+//=========================================================================
+
+// G_Kill sets the health to -999 and calls player_die directly, so it never
+// passes MOBA_ShouldBlockDamage: without this a player could kill himself during
+// the draft or the buy phase and a dead player counts towards the team wipe
+// that ends the round.
+qboolean MOBA_CanSuicide( gentity_t *ent )
+{
+	if ( !mobaEnabled || !ent || !ent->client )
+	{
+		return qtrue;
+	}
+
+	if ( mobaPhase != MOBA_PHASE_FIGHT )
+	{
+		MOBA_CPSelf( ent, "^3No suicide outside the fight.\n" );
+		return qfalse;
+	}
+
+	return qtrue;
+}
+
+//=========================================================================
 // Damage integration
 //=========================================================================
 
@@ -902,8 +988,9 @@ qboolean MOBA_ShouldBlockDamage( gentity_t *targ, gentity_t *attacker )
 		return qtrue;
 	}
 
-	if ( mobaPhase != MOBA_PHASE_FIGHT &&
-		targ->client->sess.sessionTeam != TEAM_SPECTATOR )
+	// outside the fight nobody can be hurt, that covers the draft, the buy
+	// phase and the round end
+	if ( mobaPhase != MOBA_PHASE_FIGHT )
 	{
 		return qtrue;
 	}
@@ -933,7 +1020,10 @@ int MOBA_AdjustDamage( gentity_t *targ, gentity_t *attacker, int damage )
 	mobaPlayer_t *p;
 	float mult;
 
-	if ( !mobaEnabled || !attacker || !attacker->client || targ == attacker )
+	// vehicles and other scripted entities carry a client pointer but do not
+	// sit in a client slot, they must never index the player array
+	if ( !mobaEnabled || !attacker || !attacker->client || targ == attacker ||
+		attacker->s.number < 0 || attacker->s.number >= MAX_CLIENTS )
 	{
 		return damage;
 	}
@@ -946,6 +1036,13 @@ int MOBA_AdjustDamage( gentity_t *targ, gentity_t *attacker, int damage )
 	}
 	else
 	{
+		// an expired buff keeps its multiplier in the struct, reset it here so
+		// the value the player sees in !status matches what the damage does
+		if ( p->buffMult != 1.0f )
+		{
+			p->buffMult = 1.0f;
+		}
+
 		mult = p->dmgMult;
 	}
 
@@ -1000,13 +1097,13 @@ static void MOBA_ApplyHeroStats( gentity_t *ent )
 		}
 	}
 
-	if ( health > 10000 )
+	if ( health > MOBA_MAX_HEALTH )
 	{
-		health = 10000;
+		health = MOBA_MAX_HEALTH;
 	}
-	if ( armor > 100 )
+	if ( armor > MOBA_MAX_ARMOR )
 	{
-		armor = 100;
+		armor = MOBA_MAX_ARMOR;
 	}
 	if ( armor < 0 )
 	{
@@ -1022,6 +1119,10 @@ static void MOBA_ApplyHeroStats( gentity_t *ent )
 	ent->client->ps.stats[STAT_HEALTH] = health;
 	ent->client->ps.stats[STAT_MAX_HEALTH] = health;
 	ent->client->ps.stats[STAT_ARMOR] = armor;
+
+	// G_Damage copies ent->health back into the stat every time, so writing the
+	// stat alone leaves the HUD and the real health disagreeing after a level up
+	ent->health = health;
 }
 
 void MOBA_OnClientSpawn( gentity_t *ent )
@@ -1064,6 +1165,8 @@ void MOBA_OnClientDisconnect( gentity_t *ent )
 		mobaPlayers[ent->s.number].heroId = -1;
 		mobaPlayers[ent->s.number].autoCmdNext = 0;
 		mobaPlayers[ent->s.number].autoCmdIdx = 0;
+		mobaLastSent[ent->s.number][0] = '\0';
+		mobaShopStateLogged[ent->s.number] = qfalse;
 		MOBA_LogLine( "player disconnected, slot cleared", ent );
 	}
 }
@@ -1094,9 +1197,10 @@ static void MOBA_CheckLevelUp( gentity_t *ent, int gainedXp )
 void MOBA_OnPlayerDeath( gentity_t *self, gentity_t *attacker, int meansOfDeath )
 {
 	mobaPlayer_t *vp, *kp;
-	int xpGain, goldGain = 300;
+	int xpGain, goldGain;
 
-	if ( !mobaEnabled || !self->client )
+	if ( !mobaEnabled || !self->client ||
+		self->s.number < 0 || self->s.number >= MAX_CLIENTS )
 	{
 		return;
 	}
@@ -1107,17 +1211,21 @@ void MOBA_OnPlayerDeath( gentity_t *self, gentity_t *attacker, int meansOfDeath 
 	// never auto-respawn during a fight round
 	self->client->respawnTime = level.time + MOBA_FALLBACK_RESPAWN;
 
+	// vehicles and scripted entities have a client pointer but no client slot
 	if ( attacker && attacker->client &&
+		attacker->s.number >= 0 && attacker->s.number < MAX_CLIENTS &&
 		attacker != self &&
 		OnSameTeam( self, attacker ) == qfalse )
 	{
 		kp = &mobaPlayers[attacker->s.number];
 
-		goldGain = 300;
+		goldGain = MOBA_GOLD_KILL;
 		kp->gold += goldGain;
 		kp->roundKills++;
 
-		xpGain = 50 + vp->level * 10;
+		// the reward follows the level of the hero that was killed, farming a
+		// weak hero pays less than taking on a developed one
+		xpGain = MOBA_XP_KILL_BASE + vp->level * MOBA_XP_KILL_PER_LEVEL;
 
 		MOBA_CheckLevelUp( attacker, xpGain );
 
@@ -1319,6 +1427,20 @@ static void MOBA_CastAoEHeal( gentity_t *ent, const mobaAbility_t *ab )
 static void MOBA_CastBuff( gentity_t *ent, const mobaAbility_t *ab )
 {
 	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
+	qboolean active = ( p->buffEndTime > level.time ) ? qtrue : qfalse;
+
+	// a weaker buff must not eat a stronger one that is still running, the
+	// duration of the running buff is extended instead
+	if ( active && p->buffMult >= ab->buffMult )
+	{
+		if ( p->buffEndTime < level.time + ab->durationMs )
+		{
+			p->buffEndTime = level.time + ab->durationMs;
+		}
+
+		MOBA_CPSelf( ent, "%s! Damage stays x%.0f\n", ab->name, p->buffMult );
+		return;
+	}
 
 	p->buffMult = ab->buffMult;
 	p->buffEndTime = level.time + ab->durationMs;
@@ -1647,6 +1769,11 @@ static void MOBA_ShowStatus( gentity_t *ent )
 	MOBA_Self( ent, "XP: %i / %i, skill points: %i", p->xp, need, p->skillPoints );
 	MOBA_Self( ent, "Gold: %i", p->gold );
 
+	if ( p->roundKills > 0 )
+	{
+		MOBA_Self( ent, "Kills this round: %i", p->roundKills );
+	}
+
 	if ( p->heroId >= 0 )
 	{
 		for ( i = 0; i < MOBA_ABILITIES_PER_HERO; i++ )
@@ -1748,6 +1875,16 @@ qboolean MOBA_HandleChat( gentity_t *ent, const char *msg )
 				MOBA_CPSelf( ent, "Bad hero number! See: !heroes\n" );
 				return qtrue;
 			}
+
+			// one hero per player, a shared hero would stack two players' worth of
+			// bonuses on one body and leave the enemy team one hero short
+			if ( MOBA_HeroTaken( id ) )
+			{
+				MOBA_CPSelf( ent, "%s is already taken! See: !heroes\n",
+					mobaHeroes[id].name );
+				return qtrue;
+			}
+
 			mobaPlayers[ent->s.number].heroId = id;
 			MOBA_CPSelf( ent, "Hero picked: ^5%s^7!\n", mobaHeroes[id].name );
 		}
