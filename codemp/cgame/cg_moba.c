@@ -46,6 +46,7 @@ static const cgMobaItem_t cgMobaItems[] = {
 #define CG_MOBA_PHASE_DRAFT			1
 #define CG_MOBA_PHASE_DRAFT_ASSIGN	2
 #define CG_MOBA_PHASE_BUY			3
+#define CG_MOBA_PHASE_FIGHT			4
 
 //=========================================================================
 // State received from the server plus the local "the player closed it again"
@@ -66,6 +67,41 @@ typedef struct {
 } cgMobaState_t;
 
 static cgMobaState_t cgMoba;
+
+//=========================================================================
+// Ability bar state. The server owns the cooldowns and the bought ranks and
+// pushes them five times a second, the client counts the remaining time down in
+// between so the bar does not stutter. heroId is -1 while the player has no
+// hero, and the bar is then not drawn at all.
+//=========================================================================
+#define CG_MOBA_ABILITIES	4
+
+typedef struct {
+	int			heroId;
+	int			cooldown[CG_MOBA_ABILITIES];	// ms left at the moment of the push
+	int			level[CG_MOBA_ABILITIES];
+	int			receivedAt;
+	qboolean	received;
+	int			loggedHero;		// -2 before the first push, so the first one logs
+	qboolean	loggedCooldown;	// a running timer has been seen at least once
+} cgMobaAbility_t;
+
+static cgMobaAbility_t cgMobaAb;
+
+// what is left of a cooldown right now, the push only samples it
+static int CG_Moba_CooldownLeft( int slot )
+{
+	int left;
+
+	if ( !cgMobaAb.received || slot < 0 || slot >= CG_MOBA_ABILITIES )
+	{
+		return 0;
+	}
+
+	left = cgMobaAb.cooldown[slot] - ( cg.time - cgMobaAb.receivedAt );
+
+	return ( left > 0 ) ? left : 0;
+}
 
 //=========================================================================
 // Hero select window
@@ -155,8 +191,14 @@ static qboolean CG_Moba_Selectable( int heroId )
 
 	if ( cgMoba.phase == CG_MOBA_PHASE_DRAFT )
 	{
-		// the captains take heroes off the board, both masks are what is gone
-		return ( cgMobaDraft.redMask & cgMobaDraft.blueMask & ( 1 << heroId ) ) ? qfalse : qtrue;
+		int gone;
+
+		// the captains take heroes off the board, so a hero is gone as soon as it
+		// sits in one of the two masks. That is a union, not an intersection: a
+		// hero only one captain has taken must not be offered to the other.
+		gone = cgMobaDraft.redMask | cgMobaDraft.blueMask;
+
+		return ( gone & ( 1 << heroId ) ) ? qfalse : qtrue;
 	}
 
 	// the assign stage hands out heroes out of the pool of the own team
@@ -528,6 +570,15 @@ static void CG_Moba_DraftAct( int heroId )
 }
 
 //=========================================================================
+// The ability bar and the cast path live further down, next to the ability state
+// they work on. The key handler needs them for the click on an icon, so they are
+// announced here.
+//=========================================================================
+static qboolean CG_Moba_BarWanted( void );
+static int CG_Moba_BarAt( float mx, float my );
+static void CG_Moba_CastAbility( int slot );
+
+//=========================================================================
 // Input. Runs before the cgame decides what a key is for, because a living
 // local player would otherwise swallow every key and every mouse button.
 // Returns qtrue when the window used the key, so the game never acts on it.
@@ -538,9 +589,28 @@ static void CG_Moba_DraftAct( int heroId )
 //=========================================================================
 qboolean CG_Moba_KeyEvent( int key, qboolean down )
 {
-	int hero;
+	int hero, slot;
 
-	if ( !down || !CG_Moba_DraftWanted() )
+	if ( !down )
+	{
+		return qfalse;
+	}
+
+	// The ability bar is on screen in the fight, and a left click on one of its
+	// icons is a second way to cast. The key is consumed so the same click does
+	// not also swing the saber.
+	if ( CG_Moba_BarWanted() )
+	{
+		slot = CG_Moba_BarAt( (float)cgs.cursorX, (float)cgs.cursorY );
+
+		if ( slot >= 0 && key == A_MOUSE1 )
+		{
+			CG_Moba_CastAbility( slot );
+			return qtrue;
+		}
+	}
+
+	if ( !CG_Moba_DraftWanted() )
 	{
 		return qfalse;
 	}
@@ -684,6 +754,14 @@ static const char *CG_Moba_AbilityEffect( const mobaAbility_t *ab )
 	return va( "damage %i (+%i)  range %i", ab->baseEffect, ab->perLevelEffect,
 		(int)ab->range );
 }
+
+//=========================================================================
+// The ability bar and its icons are further down, next to the ability state
+// they draw. The hero window needs the same icons and the same key letters, so
+// it says up front what it borrows from there.
+//=========================================================================
+static const char *cgMobaAbilityKeys[CG_MOBA_ABILITIES];
+static void CG_Moba_AbilityIcon( float x, float y, float s, const mobaAbility_t *ab, float alpha );
 
 //=========================================================================
 // Draws the hero select window: every hero of the shared table on the left,
@@ -990,8 +1068,15 @@ void CG_Moba_DrawDraft( void )
 		{
 			const mobaAbility_t *ab = &hero->abilities[a];
 
-			CG_Text_Paint( x, textY, 0.6f, colorText,
-				va( "%i. %s", a + 1, ab->name ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+			// the icon says what kind of ability it is and the letter next to it
+			// is the key it goes on, so the kit is readable before the player
+			// ever enters the fight
+			CG_Moba_AbilityIcon( x, textY - 1.0f, 12.0f, ab, 1.0f );
+
+			CG_Text_Paint( x + 15.0f, textY, 0.6f, colorGold, cgMobaAbilityKeys[a],
+				0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+			CG_Text_Paint( x + 24.0f, textY, 0.6f, colorText, ab->name, 0, 0,
+				ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 			textY += 11.0f;
 
 			CG_Text_Paint( x, textY, 0.55f, colorDim,
@@ -1053,6 +1138,325 @@ void CG_Moba_ServerCommand_f( void )
 		cgMoba.logged = qtrue;
 		trap->Print( va( "MOBA: shop state received: %s (cg_moba %i)\n",
 			buf, cg_moba.integer ) );
+	}
+}
+
+//=========================================================================
+// Ability bar
+//
+// The four abilities are on Q, E, C and V. The letters live in moba.cfg as
+// binds that write a token into cg_mobaAbility, because the JKA client turns
+// keys into buttons before the cgame ever sees them (see CG_Moba_HandleToken).
+// moba.cfg is where a player rebinds them, and the bar shows the same letters,
+// so the picture on the screen and the config never disagree.
+//
+// The icons are drawn out of plain rectangles. JKA ships no art for a moba
+// kit, and the stock force icons are square jpegs without an alpha channel,
+// which would come out as black boxes on a dark panel.
+//=========================================================================
+static const char *cgMobaAbilityKeys[CG_MOBA_ABILITIES] = { "Q", "E", "C", "V" };
+
+#define CG_MOBA_BAR_SIZE		44.0f
+#define CG_MOBA_BAR_GAP		6.0f
+// high enough that the name under the boxes is not cut off by the bottom edge
+#define CG_MOBA_BAR_Y		( 480.0f - 70.0f )
+
+// left edge of a slot, the bar is centred under the crosshair
+static float CG_Moba_BarX( int slot )
+{
+	float total = (float)CG_MOBA_ABILITIES * CG_MOBA_BAR_SIZE +
+		( CG_MOBA_ABILITIES - 1 ) * CG_MOBA_BAR_GAP;
+
+	return ( 640.0f - total ) * 0.5f + slot * ( CG_MOBA_BAR_SIZE + CG_MOBA_BAR_GAP );
+}
+
+static void CG_Moba_AbilityIcon( float x, float y, float s, const mobaAbility_t *ab, float alpha )
+{
+	static const vec4_t colorDirect	= { 0.95f, 0.95f, 1.00f, 1.00f };
+	static const vec4_t colorDamage	= { 1.00f, 0.45f, 0.25f, 1.00f };
+	static const vec4_t colorHeal	= { 0.35f, 0.95f, 0.45f, 1.00f };
+	static const vec4_t colorBuff	= { 1.00f, 0.80f, 0.25f, 1.00f };
+	const vec4_t *src;
+	vec4_t color;
+	int i;
+
+	switch ( ab->type )
+	{
+	case AB_DIRECT:		src = &colorDirect;	break;
+	case AB_AOE_DAMAGE:	src = &colorDamage;	break;
+	case AB_AOE_HEAL:		src = &colorHeal;		break;
+	default:			src = &colorBuff;		break;
+	}
+
+	for ( i = 0; i < 4; i++ )
+	{
+		color[i] = (*src)[i];
+	}
+	color[3] *= alpha;
+
+	if ( ab->type == AB_DIRECT )
+	{
+		// a shaft and a triangular head, pointing right: one target
+		CG_FillRect( x + 0.08f * s, y + 0.42f * s, 0.46f * s, 0.16f * s, color );
+
+		for ( i = 0; i < 4; i++ )
+		{
+			CG_FillRect( x + ( 0.50f + 0.12f * i ) * s, y + ( 0.12f + 0.12f * i ) * s,
+				0.16f * s, ( 0.76f - 0.24f * i ) * s, color );
+		}
+	}
+	else if ( ab->type == AB_AOE_DAMAGE )
+	{
+		// an X: a burst that hits everything around the caster
+		for ( i = 0; i < 5; i++ )
+		{
+			CG_FillRect( x + ( 0.14f + 0.14f * i ) * s, y + ( 0.14f + 0.14f * i ) * s,
+				0.18f * s, 0.18f * s, color );
+			CG_FillRect( x + ( 0.68f - 0.14f * i ) * s, y + ( 0.14f + 0.14f * i ) * s,
+				0.18f * s, 0.18f * s, color );
+		}
+	}
+	else if ( ab->type == AB_AOE_HEAL )
+	{
+		// a plus
+		CG_FillRect( x + 0.40f * s, y + 0.14f * s, 0.20f * s, 0.72f * s, color );
+		CG_FillRect( x + 0.14f * s, y + 0.40f * s, 0.72f * s, 0.20f * s, color );
+	}
+	else
+	{
+		// an arrow pointing up: a buff on the caster himself
+		for ( i = 0; i < 4; i++ )
+		{
+			CG_FillRect( x + ( 0.16f + 0.16f * i ) * s, y + ( 0.12f + 0.14f * i ) * s,
+				( 0.68f - 0.32f * i ) * s, 0.16f * s, color );
+		}
+
+		CG_FillRect( x + 0.44f * s, y + 0.60f * s, 0.12f * s, 0.28f * s, color );
+	}
+}
+
+// which slot the mouse is over, -1 when it is nowhere near the bar
+static int CG_Moba_BarAt( float mx, float my )
+{
+	int i;
+
+	for ( i = 0; i < CG_MOBA_ABILITIES; i++ )
+	{
+		float x = CG_Moba_BarX( i );
+
+		if ( mx >= x && mx < x + CG_MOBA_BAR_SIZE &&
+			my >= CG_MOBA_BAR_Y && my < CG_MOBA_BAR_Y + CG_MOBA_BAR_SIZE )
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+// The bar belongs to the two phases where a hero can act. During the draft the
+// hero window owns the screen and the player has no hero yet, and in the lobby
+// there is nothing to cast.
+static qboolean CG_Moba_BarWanted( void )
+{
+	if ( !cg_moba.integer || !cgMobaAb.received || cgMobaAb.heroId < 0 ||
+		cgMobaAb.heroId >= MOBA_MAX_HEROES || !cgMoba.received )
+	{
+		return qfalse;
+	}
+
+	if ( cgMoba.phase != CG_MOBA_PHASE_BUY && cgMoba.phase != CG_MOBA_PHASE_FIGHT )
+	{
+		return qfalse;
+	}
+
+	// the shop panel sits on the left, the bar is in the middle: they do not
+	// overlap, so both may be on screen at the same time
+	return qtrue;
+}
+
+//=========================================================================
+// Casting. The server owns every rule (phase, hero, life, cooldown) and answers
+// with the reason when it refuses, so the client does not second guess it and
+// only makes sure the same key cannot fire twice in one frame.
+//=========================================================================
+static void CG_Moba_CastAbility( int slot )
+{
+	if ( slot < 0 || slot >= CG_MOBA_ABILITIES || !CG_Moba_BarWanted() )
+	{
+		return;
+	}
+
+	// the same chat command a player would type, which is what the server
+	// already answers: the newline is part of the command (CG_Moba_HandleToken)
+	trap->SendConsoleCommand( va( "cmd say !%i\n", slot + 1 ) );
+}
+
+static void CG_Moba_AbilityInput( void )
+{
+	static char lastToken[16] = "0";
+	char token[16];
+
+	trap->Cvar_VariableStringBuffer( "cg_mobaAbility", token, sizeof( token ) );
+
+	if ( Q_stricmp( token, lastToken ) == 0 )
+	{
+		return;
+	}
+
+	Q_strncpyz( lastToken, token, sizeof( lastToken ) );
+
+	if ( token[0] >= '1' && token[0] <= '4' && !token[1] )
+	{
+		CG_Moba_CastAbility( token[0] - '1' );
+	}
+
+	// clear the token again so the same key can fire the next one
+	trap->SendConsoleCommand( "set cg_mobaAbility 0\n" );
+}
+
+static void CG_Moba_DrawAbilityBar( void )
+{
+	static vec4_t colorBg		= { 0.02f, 0.02f, 0.05f, 0.80f };
+	static vec4_t colorBorder	= { 0.60f, 0.50f, 0.20f, 0.95f };
+	static vec4_t colorReady	= { 0.30f, 0.90f, 0.40f, 0.90f };
+	static vec4_t colorWait		= { 0.35f, 0.35f, 0.40f, 0.90f };
+	static vec4_t colorShade	= { 0.00f, 0.00f, 0.00f, 0.65f };
+	static vec4_t colorKey		= { 1.00f, 0.85f, 0.30f, 1.00f };
+	static vec4_t colorText		= { 1.00f, 1.00f, 1.00f, 1.00f };
+	static vec4_t colorName		= { 0.75f, 0.75f, 0.75f, 1.00f };
+	static vec4_t colorDim		= { 0.60f, 0.60f, 0.60f, 1.00f };
+
+	const mobaHero_t *hero = &mobaHeroTable[cgMobaAb.heroId];
+	const mobaAbility_t *ab;
+	float x, w;
+	int i, left, rank;
+
+	if ( !CG_Moba_BarWanted() )
+	{
+		return;
+	}
+
+	for ( i = 0; i < CG_MOBA_ABILITIES; i++ )
+	{
+		ab = &hero->abilities[i];
+		left = CG_Moba_CooldownLeft( i );
+		rank = cgMobaAb.level[i];
+		x = CG_Moba_BarX( i );
+
+		CG_FillRect( x, CG_MOBA_BAR_Y, CG_MOBA_BAR_SIZE, CG_MOBA_BAR_SIZE, colorBg );
+		CG_DrawRect( x, CG_MOBA_BAR_Y, CG_MOBA_BAR_SIZE, CG_MOBA_BAR_SIZE, 1.0f,
+			( left > 0 ) ? colorWait : colorReady );
+
+		CG_Moba_AbilityIcon( x + 9.0f, CG_MOBA_BAR_Y + 9.0f, 26.0f, ab,
+			( left > 0 ) ? 0.35f : 1.0f );
+
+		// the key in the corner and the rank under the icon, so the player can
+		// see at a glance what is on which key and what he upgraded
+		CG_Text_Paint( x + 3.0f, CG_MOBA_BAR_Y + 1.0f, 0.62f, colorKey,
+			cgMobaAbilityKeys[i], 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+
+		if ( rank > 0 )
+		{
+			CG_Text_Paint( x + CG_MOBA_BAR_SIZE - 12.0f, CG_MOBA_BAR_Y + 1.0f, 0.55f,
+				colorText, va( "%i", rank ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+		}
+
+		if ( left > 0 )
+		{
+			// the part of the icon that is still on cooldown, counted from the
+			// top, and the seconds left on top of it
+			float frac = (float)ab->cooldownMs > 0.0f ?
+				(float)left / (float)ab->cooldownMs : 0.0f;
+
+			if ( frac > 1.0f )
+			{
+				frac = 1.0f;
+			}
+
+			CG_FillRect( x + 1.0f, CG_MOBA_BAR_Y + 1.0f, CG_MOBA_BAR_SIZE - 2.0f,
+				( CG_MOBA_BAR_SIZE - 2.0f ) * frac, colorShade );
+
+			w = (float)CG_Text_Width( va( "%i", ( left + 999 ) / 1000 ), 0.7f, FONT_SMALL );
+			CG_Text_Paint( x + ( CG_MOBA_BAR_SIZE - w ) * 0.5f, CG_MOBA_BAR_Y + 16.0f,
+				0.7f, colorText, va( "%i", ( left + 999 ) / 1000 ), 0, 0,
+				ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+		}
+
+		// the name under the box, shortened to what fits
+		CG_Text_Paint( x + ( CG_MOBA_BAR_SIZE -
+				(float)CG_Text_Width( ab->name, 0.5f, FONT_SMALL ) ) * 0.5f,
+			CG_MOBA_BAR_Y + CG_MOBA_BAR_SIZE + 1.0f, 0.5f,
+			( left > 0 ) ? colorDim : colorName, ab->name, 0, 0,
+			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	}
+}
+
+//=========================================================================
+// Server command handler for the ability bar:
+// "mobaAbilities heroId cd0 cd1 cd2 cd3 lv0 lv1 lv2 lv3".
+//
+// The hero id comes first so the bar knows whose four abilities it draws, and
+// the cooldowns are milliseconds rather than seconds: a 6 second cooldown that
+// ticks in whole seconds would sit at "1" for a full second and then jump.
+//=========================================================================
+void CG_Moba_AbilitiesCommand_f( void )
+{
+	char buf[64], *p;
+	int v[9], i;
+
+	if ( !CG_Argv( 1 ) || !CG_Argv( 1 )[0] || cg_moba.integer == 0 )
+	{
+		return;
+	}
+
+	Q_strncpyz( buf, CG_Argv( 1 ), sizeof( buf ) );
+	p = buf;
+	for ( i = 0; i < 9; i++ )
+	{
+		v[i] = strtol( p, &p, 10 );
+		while ( *p == ' ' )
+		{
+			p++;
+		}
+	}
+
+	cgMobaAb.heroId = v[0];
+
+	for ( i = 0; i < CG_MOBA_ABILITIES; i++ )
+	{
+		cgMobaAb.cooldown[i] = v[1 + i];
+		cgMobaAb.level[i] = v[5 + i];
+	}
+
+	cgMobaAb.receivedAt = cg.time;
+	cgMobaAb.received = qtrue;
+
+	// Only the headless test reads this, and it has to stay rare: once per hero,
+	// and once for the first cooldown that is actually running, which is what
+	// proves the bar got a timer to draw.
+	if ( cgMobaAb.loggedHero != cgMobaAb.heroId || !cgMobaAb.loggedCooldown )
+	{
+		qboolean running = qfalse;
+
+		for ( i = 0; i < CG_MOBA_ABILITIES; i++ )
+		{
+			if ( cgMobaAb.cooldown[i] > 0 )
+			{
+				running = qtrue;
+			}
+		}
+
+		if ( running )
+		{
+			cgMobaAb.loggedCooldown = qtrue;
+		}
+
+		if ( cgMobaAb.loggedHero != cgMobaAb.heroId || running )
+		{
+			cgMobaAb.loggedHero = cgMobaAb.heroId;
+			trap->Print( va( "MOBA: ability state received: %s\n", buf ) );
+		}
 	}
 }
 
@@ -1191,6 +1595,11 @@ void CG_Moba_Draw( void )
 	CG_Moba_DrawCursor();
 
 	CG_Moba_Input();
+	CG_Moba_AbilityInput();
+
+	// the ability bar belongs to the bottom of the screen and the shop panel to
+	// the upper left, so they can be on screen together
+	CG_Moba_DrawAbilityBar();
 
 	if ( !CG_Moba_ShopOpen() )
 	{

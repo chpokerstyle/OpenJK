@@ -17,6 +17,7 @@ static void MOBA_StartAssign( void );
 static void MOBA_DraftPrompt( void );
 static void MOBA_TransferCaptain( int seat, const char *why );
 static void MOBA_RunAutoDraft( void );
+static void MOBA_ApplyHeroModel( gentity_t *ent );
 
 #define MOBA_DEFAULT_MAXHEALTH	500
 #define MOBA_DEFAULT_ARMOR		50
@@ -27,6 +28,11 @@ static void MOBA_RunAutoDraft( void );
 // for exactly the heroes that are supposed to buy them.
 #define MOBA_MAX_ARMOR			200
 #define MOBA_MAX_HEALTH			10000
+
+// Two players that spawn closer than this are treated as standing on the same
+// spot: the spawn logic only uses a spot when it is this far away from every
+// other living player.
+#define MOBA_SPAWN_CLEAR		192.0f
 
 // gold and xp for a hero kill, the round win and round loss payouts are in
 // MOBA_StartRoundEnd
@@ -609,6 +615,7 @@ static void MOBA_FillMissingHeroes( void )
 		}
 
 		mobaPlayers[i].heroId = heroId;
+		MOBA_ApplyHeroModel( ent );
 		MOBA_LogLine( va( "%s plays %s", ent->client->pers.netname,
 			mobaHeroes[heroId].name ), ent );
 	}
@@ -1343,6 +1350,8 @@ static void MOBA_RunTestBots( void )
 // its gold or its item mask
 static char mobaLastSent[MAX_CLIENTS][64];
 static char mobaLastDraftSent[MAX_CLIENTS][128];
+static char mobaAbilitiesSent[MAX_CLIENTS][64];
+static int mobaAbilitiesNext[MAX_CLIENTS];
 static qboolean mobaShopStateLogged[MAX_CLIENTS];
 static qboolean mobaDraftStateLogged[MAX_CLIENTS];
 
@@ -1497,6 +1506,71 @@ static void MOBA_PushDraftState( int clientNum )
 	}
 }
 
+//=========================================================================
+// Pushes the four ability slots of one client to its own cgame:
+// "mobaAbilities heroId cd0 cd1 cd2 cd3 lv0 lv1 lv2 lv3".
+//
+// The hero id is repeated even though the draft push already carries it,
+// because the bar in the fight phase has to know which hero it draws and the
+// hero is not part of the shop state. cd is the milliseconds a slot still has
+// to wait, lv the rank the player bought, so the client can grey the slot out
+// and count down without asking anything.
+//
+// A running cooldown changes the numbers on every frame, so the push is rate
+// limited to five times a second; the client counts the remaining time down on
+// its own between the pushes, exactly like the phase timer.
+//=========================================================================
+static void MOBA_PushAbilityState( int clientNum )
+{
+	gentity_t *ent = &g_entities[clientNum];
+	mobaPlayer_t *p = &mobaPlayers[clientNum];
+	char buf[64];
+	int i, cd[MOBA_ABILITIES_PER_HERO], lv[MOBA_ABILITIES_PER_HERO];
+
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ||
+		!ent->inuse || !ent->client ||
+		ent->client->pers.connected != CON_CONNECTED || !p->inuse )
+	{
+		return;
+	}
+
+	if ( p->heroId < 0 || p->heroId >= mobaNumHeroes )
+	{
+		// no hero yet, so a bar of a previous hero must not stay on screen
+		if ( mobaAbilitiesSent[clientNum][0] != '\0' )
+		{
+			mobaAbilitiesSent[clientNum][0] = '\0';
+			trap->SendServerCommand( ent->s.number, "mobaAbilities \"-1 0 0 0 0 0 0 0 0\"" );
+		}
+		return;
+	}
+
+	for ( i = 0; i < MOBA_ABILITIES_PER_HERO; i++ )
+	{
+		cd[i] = ( p->cdReady[i] > level.time ) ? ( p->cdReady[i] - level.time ) : 0;
+		lv[i] = p->abilityLevel[i];
+	}
+
+	Com_sprintf( buf, sizeof( buf ), "%i %i %i %i %i %i %i %i %i", p->heroId,
+		cd[0], cd[1], cd[2], cd[3], lv[0], lv[1], lv[2], lv[3] );
+
+	if ( Q_stricmp( buf, mobaAbilitiesSent[clientNum] ) == 0 )
+	{
+		return;
+	}
+
+	// the very first push of a slot goes out right away, a later change waits for
+	// the tick of the rate limit
+	if ( mobaAbilitiesSent[clientNum][0] != '\0' && level.time < mobaAbilitiesNext[clientNum] )
+	{
+		return;
+	}
+
+	mobaAbilitiesNext[clientNum] = level.time + 200;
+	Q_strncpyz( mobaAbilitiesSent[clientNum], buf, sizeof( mobaAbilitiesSent[clientNum] ) );
+	trap->SendServerCommand( ent->s.number, va( "mobaAbilities \"%s\"", buf ) );
+}
+
 void MOBA_RunFrame( void )
 {
 	int i;
@@ -1520,6 +1594,7 @@ void MOBA_RunFrame( void )
 	{
 		MOBA_PushShopState( i );
 		MOBA_PushDraftState( i );
+		MOBA_PushAbilityState( i );
 	}
 
 	switch ( mobaPhase )
@@ -1808,6 +1883,71 @@ static void MOBA_ApplyHeroStats( gentity_t *ent )
 	ent->health = health;
 }
 
+//=========================================================================
+// Hero model
+//=========================================================================
+// A player walks into the match as the hero he picked, so every hero carries
+// the name of a stock models/players model. The client renders whatever model
+// its own userinfo names, and the server is the only side that can change it,
+// so the hero model is written into the userinfo and the clientinfo is rebuilt:
+// every other client picks the new body up through CS_PLAYERS on the next
+// snapshot.
+//
+// The team suffix is not decoration. A team game validates the skin against the
+// model and falls back to model_red.skin or model_blue.skin, and every model in
+// the table ships both, so the teams stay apart visually.
+//
+// This is not a stock client feature: it needs d_perPlayerGhoul2 1 from
+// moba.cfg, otherwise the server keeps one shared Kyle body for hit detection
+// while the clients draw something else.
+static void MOBA_ApplyHeroModel( gentity_t *ent )
+{
+	mobaPlayer_t *p;
+	char userinfo[MAX_INFO_STRING] = {0}, want[MAX_QPATH];
+	const char *skin, *current;
+	int num;
+
+	if ( !mobaEnabled || !ent->client )
+	{
+		return;
+	}
+
+	num = ent->s.number;
+	if ( num < 0 || num >= MAX_CLIENTS )
+	{
+		return;
+	}
+
+	p = &mobaPlayers[num];
+
+	if ( !p->inuse ||
+		ent->client->pers.connected != CON_CONNECTED ||
+		p->heroId < 0 || p->heroId >= mobaNumHeroes ||
+		!mobaHeroes[p->heroId].model || !mobaHeroes[p->heroId].model[0] )
+	{
+		return;
+	}
+
+	skin = ( ent->client->sess.sessionTeam == TEAM_BLUE ) ? "blue" : "red";
+	Q_strncpyz( want, va( "%s/%s", mobaHeroes[p->heroId].model, skin ), sizeof( want ) );
+
+	trap->GetUserinfo( num, userinfo, sizeof( userinfo ) );
+	current = Info_ValueForKey( userinfo, "model" );
+
+	// The client sends its own userinfo on every respawn and would put the model
+	// cvar back, so this has to run on every spawn. It only writes when the
+	// value really differs, because ClientUserinfoChanged rebuilds the whole
+	// clientinfo string and re-registers the skin.
+	if ( current && !Q_stricmp( current, want ) )
+	{
+		return;
+	}
+
+	Info_SetValueForKey( userinfo, "model", want );
+	trap->SetUserinfo( num, userinfo );
+	ClientUserinfoChanged( num );
+}
+
 void MOBA_OnClientSpawn( gentity_t *ent )
 {
 	if ( !mobaEnabled || !ent->client )
@@ -1818,6 +1958,7 @@ void MOBA_OnClientSpawn( gentity_t *ent )
 	mobaPlayers[ent->s.number].inuse = qtrue;
 	mobaPlayers[ent->s.number].dead = qfalse;
 	MOBA_ApplyHeroStats( ent );
+	MOBA_ApplyHeroModel( ent );
 
 	// A player who never saw the manual has no way to find the commands, so the
 	// hint goes out once per connection instead of waiting for !help.
@@ -1829,7 +1970,7 @@ void MOBA_OnClientSpawn( gentity_t *ent )
 			"^3B^7 - open the shop panel in the buy phase,\n"
 			"^3G H J N X ;^7 - buy an item, ^3B^7 - close it,\n"
 			"!buy N|code - buy, !buyall - buy everything affordable,\n"
-			"!upgrade N - upgrade ability, !1-!4 - abilities,\n"
+			"!upgrade N - upgrade ability, ^3Q E C V^7 - abilities on the bar,\n"
 			"!buyback - return after death, !status - stats, !help - all commands\n" );
 	}
 }
@@ -1864,6 +2005,8 @@ void MOBA_OnClientDisconnect( gentity_t *ent )
 		mobaShopStateLogged[ent->s.number] = qfalse;
 		mobaLastDraftSent[ent->s.number][0] = '\0';
 		mobaDraftStateLogged[ent->s.number] = qfalse;
+		mobaAbilitiesSent[ent->s.number][0] = '\0';
+		mobaAbilitiesNext[ent->s.number] = 0;
 		MOBA_LogLine( "player disconnected, slot cleared", ent );
 	}
 }
@@ -1970,14 +2113,65 @@ gentity_t *MOBA_PickSpawnPoint( gentity_t *ent, vec3_t origin, vec3_t angles )
 			}
 		}
 
-		if ( count > 0 )
+	if ( count > 0 )
+	{
+		int i, j, best = 0, clear = 0;
+		int clearSpots[ARRAY_LEN( ents )];
+		float gap[ARRAY_LEN( ents )], bestGap = -1.0f;
+
+		// Picking a spot at random drops two players onto the same origin, and two
+		// bodies in one spot means one of them is stuck inside the other. So every
+		// spot is scored by how far the closest living player stands from it.
+		//
+		// Spots that are far enough from everybody are candidates and one of them
+		// is taken at random, which keeps the spawns varied. Only when the map has
+		// fewer spots than players does the emptiest one win, so a full spawn
+		// area still puts everybody as far apart as it can.
+		for ( i = 0; i < count; i++ )
 		{
-			spot = ents[Q_irand( 0, count - 1 )];
-			VectorCopy( spot->s.origin, origin );
-			VectorCopy( spot->s.angles, angles );
-			angles[PITCH] = 0;
-			return spot;
+			gap[i] = 999999.0f;
+
+			for ( j = 0; j < level.maxclients; j++ )
+			{
+				gentity_t *other = &g_entities[j];
+				vec3_t diff;
+
+				if ( other == ent || !other->inuse || !other->client ||
+					other->s.number < 0 || other->s.number >= MAX_CLIENTS ||
+					other->client->pers.connected != CON_CONNECTED ||
+					other->client->sess.sessionTeam == TEAM_SPECTATOR ||
+					other->client->ps.pm_type == PM_DEAD )
+				{
+					continue;
+				}
+
+				VectorSubtract( other->client->ps.origin, ents[i]->s.origin, diff );
+				gap[i] = min( gap[i], VectorLength( diff ) );
+			}
+
+			if ( gap[i] > bestGap )
+			{
+				bestGap = gap[i];
+				best = i;
+			}
+
+			if ( gap[i] >= MOBA_SPAWN_CLEAR )
+			{
+				clearSpots[clear++] = i;
+			}
 		}
+
+		if ( clear > 0 )
+		{
+			best = clearSpots[Q_irand( 0, clear - 1 )];
+		}
+
+		spot = ents[best];
+		VectorCopy( spot->s.origin, origin );
+		VectorCopy( spot->s.angles, angles );
+		angles[PITCH] = 0;
+		return spot;
+	}
 	}
 
 	return SelectSpawnPoint( ent->client->ps.origin, origin, angles, team, qfalse );
@@ -2638,6 +2832,7 @@ static void MOBA_DraftPick( gentity_t *ent, const char *arg )
 	}
 
 	mobaPlayers[ent->s.number].heroId = heroId;
+	MOBA_ApplyHeroModel( ent );
 	MOBA_CPSelf( ent, "Hero picked: ^5%s^7!\n", mobaHeroes[heroId].name );
 	MOBA_LogLine( va( "%s plays %s", ent->client->pers.netname,
 		mobaHeroes[heroId].name ), ent );
