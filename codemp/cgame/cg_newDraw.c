@@ -22,6 +22,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "cg_local.h"
+#include "cg_moba.h"
 #include "ui/ui_shared.h"
 
 extern displayContextDef_t cgDC;
@@ -831,6 +832,13 @@ void CG_EventHandling(int type) {
 
 
 void CG_KeyEvent(int key, qboolean down) {
+
+	// The MOBA hero window is a modal panel and needs the mouse buttons while
+	// the local player is alive, which is exactly the case the checks below
+	// throw away, so its hook runs first.
+	if ( CG_Moba_KeyEvent( key, down ) ) {
+		return;
+	}
 
 	if (!down) {
 		return;

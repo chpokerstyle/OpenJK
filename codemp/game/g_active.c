@@ -24,6 +24,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 #include "g_local.h"
 #include "bg_saga.h"
+#include "g_moba.h"
 
 extern void Jedi_Cloak( gentity_t *self );
 extern void Jedi_Decloak( gentity_t *self );
@@ -3554,6 +3555,16 @@ void ClientThink( int clientNum, usercmd_t *ucmd ) {
 	if (clientNum < MAX_CLIENTS)
 	{
 		trap->GetUsercmd( clientNum, &ent->client->pers.cmd );
+
+		// While a draft runs the client hands the mouse to the hero window, so the
+		// same left click that bans or picks a hero must not swing the saber. The
+		// engine keeps no other cgame panel, so this is the only place that can
+		// take the attack out of the command before the player state is built.
+		if ( MOBA_Active() &&
+			( MOBA_GetPhase() == MOBA_PHASE_DRAFT || MOBA_GetPhase() == MOBA_PHASE_DRAFT_ASSIGN ) )
+		{
+			ent->client->pers.cmd.buttons &= ~(BUTTON_ATTACK|BUTTON_ALT_ATTACK|BUTTON_FORCEGRIP|BUTTON_ANY);
+		}
 	}
 
 	// mark the time we got info, so we can display the

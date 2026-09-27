@@ -1614,6 +1614,7 @@ static serverCommand_t	commands[] = {
 	{ "loaddefered",		CG_LoadDeferredPlayers }, // FIXME: spelled wrong, but not changing for demo
 	{ "ltchat",				CG_Chat_f },
 	{ "map_restart",		CG_MapRestart },
+	{ "mobaDraft",			CG_Moba_DraftCommand_f },
 	{ "mobaShop",			CG_Moba_ServerCommand_f },
 	{ "nfr",				CG_NewForceRank_f },
 	{ "print",				CG_Print_f },

@@ -7,8 +7,8 @@ MagicWands MOBA mod - OpenJK game code (server-side)
 #ifndef G_MOBA_H
 #define G_MOBA_H
 
-#define MOBA_MAX_HEROES			30
-#define MOBA_ABILITIES_PER_HERO	4
+#include "moba_content.h"
+
 #define MOBA_MAX_ITEMS			6
 #define MOBA_MAX_SKILL_LEVEL	5
 
@@ -33,37 +33,8 @@ typedef enum {
 	MOBA_PHASE_ROUNDEND			// brief intermission between rounds
 } mobaPhase_t;
 
-// ---- Ability behaviour ----
-typedef enum {
-	AB_DIRECT		= 0,	// raycast under crosshair, damage single enemy
-	AB_AOE_DAMAGE	= 1,	// damage all enemies in a radius around caster
-	AB_AOE_HEAL		= 2,	// heal all allies (incl. self) in a radius
-	AB_BUFF			= 3		// self buff: damage multiplier for duration
-} mobaAbilityType_t;
-
-typedef struct {
-	const char		*name;
-	int				type;
-	int				cooldownMs;
-	int				baseEffect;		// base damage / heal
-	int				perLevelEffect;
-	float			range;			// for AB_DIRECT
-	float			radius;			// for AoE
-	int				durationMs;		// for AB_BUFF
-	float			buffMult;		// multiplier for AB_BUFF
-	const char		*desc;
-} mobaAbility_t;
-
-typedef struct {
-	const char		*name;
-	const char		*role;
-	int				baseHealth;
-	int				healthPerLevel;
-	int				baseArmor;
-	int				baseDamage;		// reserved for auto-attack scaling
-	int				damagePerLevel;
-	mobaAbility_t	abilities[MOBA_ABILITIES_PER_HERO];
-} mobaHero_t;
+// ---- Ability behaviour, hero table and mobaHero_t live in moba_content.h,
+// both the server and the cgame include that one copy ----
 
 // ---- Shop items ----
 typedef struct {
@@ -109,6 +80,7 @@ extern mobaPlayer_t		mobaPlayers[MAX_CLIENTS];
 void					MOBA_InitGame( void );			// g_main: G_InitGame
 void					MOBA_RunFrame( void );			// g_main: G_RunFrame (once per frame)
 qboolean				MOBA_Active( void );			// g_moba cvar is 1
+mobaPhase_t				MOBA_GetPhase( void );		// g_active: ClientThink blocks attacks while a draft runs
 qboolean				MOBA_CanSuicide( gentity_t *ent );	// g_cmds: G_Kill
 qboolean				MOBA_ShouldBlockDamage( gentity_t *targ, gentity_t *attacker );
 int						MOBA_AdjustDamage( gentity_t *targ, gentity_t *attacker, int damage );

@@ -1,4 +1,4 @@
-﻿/*
+/*
 ===========================================================================
 MagicWands MOBA mod - OpenJK game code (server-side) - implementation
 ===========================================================================
@@ -83,8 +83,6 @@ static int MOBA_TeamSeat( team_t team )
 //=========================================================================
 // Hero / item tables
 //=========================================================================
-
-#define AB(n,t,cd,d,pl,r,rad,dur,mul,desc) { n, t, cd, d, pl, r, rad, dur, mul, desc }
 
 mobaHero_t mobaHeroes[MOBA_MAX_HEROES];
 int mobaNumHeroes = 0;
@@ -1344,7 +1342,9 @@ static void MOBA_RunTestBots( void )
 // otherwise start with the previous occupant's state and never be told about
 // its gold or its item mask
 static char mobaLastSent[MAX_CLIENTS][64];
+static char mobaLastDraftSent[MAX_CLIENTS][128];
 static qboolean mobaShopStateLogged[MAX_CLIENTS];
+static qboolean mobaDraftStateLogged[MAX_CLIENTS];
 
 //=========================================================================
 // Pushes the shop state of a client to its own cgame with a server command:
@@ -1388,6 +1388,102 @@ static void MOBA_PushShopState( int clientNum )
 	}
 }
 
+//=========================================================================
+// Pushes the draft picture to one client so the hero select window can render
+// the bans, the team picks and the turn of that very client:
+// "mobaDraft banned red blue action canAct seconds myHero step steps".
+//
+// The three hero sets are sent as bit masks: 30 heroes fit into an int, one
+// command carries the whole state and the cgame never has to ask the server
+// twice for the same thing. action is 0 nothing to do, 1 ban, 2 pick and
+// canAct is the only field the client is not allowed to guess, because "whose
+// turn is it" changes whenever a captain times out or disconnects.
+//=========================================================================
+static void MOBA_PushDraftState( int clientNum )
+{
+	gentity_t *ent = &g_entities[clientNum];
+	char buf[128];
+	int banned = 0, red = 0, blue = 0, i, action, canAct, secs;
+
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ||
+		!ent->inuse || !ent->client ||
+		ent->client->pers.connected != CON_CONNECTED || !mobaPlayers[clientNum].inuse )
+	{
+		return;
+	}
+
+	if ( mobaPhase != MOBA_PHASE_DRAFT && mobaPhase != MOBA_PHASE_DRAFT_ASSIGN )
+	{
+		// outside the draft the window is closed, but the last masks have to be
+		// cleared so a client that missed a phase change cannot draw a stale
+		// board on the next draft
+		if ( mobaLastDraftSent[clientNum][0] != '\0' )
+		{
+			mobaLastDraftSent[clientNum][0] = '\0';
+			trap->SendServerCommand( ent->s.number, "mobaDraft \"0 0 0 0 0 0 -1 0 0\"" );
+		}
+		return;
+	}
+
+	for ( i = 0; i < mobaNumHeroes && i < MOBA_MAX_HEROES; i++ )
+	{
+		if ( mobaHeroBanned[i] )
+		{
+			banned |= ( 1 << i );
+		}
+		else if ( mobaHeroTeam[i] == TEAM_RED )
+		{
+			red |= ( 1 << i );
+		}
+		else if ( mobaHeroTeam[i] == TEAM_BLUE )
+		{
+			blue |= ( 1 << i );
+		}
+	}
+
+	action = 0;
+	canAct = 0;
+
+	if ( mobaPhase == MOBA_PHASE_DRAFT )
+	{
+		// the plan can be walked out one frame before the phase switches to the
+		// assign stage, and mobaDraftPlan is a fixed size array
+		if ( mobaDraftStep < mobaDraftPlanLen )
+		{
+			action = ( mobaDraftPlan[mobaDraftStep] == MOBA_DRAFT_BAN ) ? 1 : 2;
+		}
+
+		canAct = MOBA_IsActingCaptain( ent ) ? 1 : 0;
+	}
+	else
+	{
+		// every player takes one hero out of the pool of his own team, so the
+		// action is always a pick here
+		action = 2;
+		canAct = ( mobaPlayers[clientNum].heroId < 0 &&
+			( ent->client->sess.sessionTeam == TEAM_RED ||
+				ent->client->sess.sessionTeam == TEAM_BLUE ) ) ? 1 : 0;
+	}
+
+	secs = ( mobaPhaseEnd > level.time ) ? ( mobaPhaseEnd - level.time + 999 ) / 1000 : 0;
+
+	Com_sprintf( buf, sizeof( buf ), "%i %i %i %i %i %i %i %i %i",
+		banned, red, blue, action, canAct, secs,
+		mobaPlayers[clientNum].heroId, mobaDraftStep, mobaDraftPlanLen );
+
+	if ( Q_stricmp( buf, mobaLastDraftSent[clientNum] ) != 0 )
+	{
+		Q_strncpyz( mobaLastDraftSent[clientNum], buf, sizeof( mobaLastDraftSent[clientNum] ) );
+		trap->SendServerCommand( ent->s.number, va( "mobaDraft \"%s\"", buf ) );
+
+		if ( !mobaDraftStateLogged[clientNum] )
+		{
+			mobaDraftStateLogged[clientNum] = qtrue;
+			MOBA_LogLine( va( "draft state -> client %i: %s", clientNum, buf ), NULL );
+		}
+	}
+}
+
 void MOBA_RunFrame( void )
 {
 	int i;
@@ -1410,6 +1506,7 @@ void MOBA_RunFrame( void )
 	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
 	{
 		MOBA_PushShopState( i );
+		MOBA_PushDraftState( i );
 	}
 
 	switch ( mobaPhase )
@@ -1509,6 +1606,11 @@ void MOBA_RunFrame( void )
 qboolean MOBA_Active( void )
 {
 	return mobaEnabled;
+}
+
+mobaPhase_t MOBA_GetPhase( void )
+{
+	return mobaPhase;
 }
 
 //=========================================================================
@@ -1747,6 +1849,8 @@ void MOBA_OnClientDisconnect( gentity_t *ent )
 		mobaPlayers[ent->s.number].autoCmdIdx = 0;
 		mobaLastSent[ent->s.number][0] = '\0';
 		mobaShopStateLogged[ent->s.number] = qfalse;
+		mobaLastDraftSent[ent->s.number][0] = '\0';
+		mobaDraftStateLogged[ent->s.number] = qfalse;
 		MOBA_LogLine( "player disconnected, slot cleared", ent );
 	}
 }
@@ -2127,30 +2231,26 @@ static void MOBA_CastAbility( gentity_t *ent, int slot )
 // the way !pick expects them.
 static void MOBA_ListHeroes( gentity_t *ent )
 {
-	int i, pool[MOBA_MAX_HEROES], count, j;
-	team_t team;
+	int i;
+	team_t team = ent->client->sess.sessionTeam;
+	qboolean assign = ( mobaPhase == MOBA_PHASE_DRAFT_ASSIGN ) ? qtrue : qfalse;
 
-	if ( mobaPhase == MOBA_PHASE_DRAFT_ASSIGN &&
-		( ent->client->sess.sessionTeam == TEAM_RED ||
-			ent->client->sess.sessionTeam == TEAM_BLUE ) )
+	if ( assign && ( team == TEAM_RED || team == TEAM_BLUE ) )
 	{
-		team = ent->client->sess.sessionTeam;
-		count = MOBA_TeamPool( team, pool, ARRAY_LEN( pool ) );
-
-		MOBA_Self( ent, "^3Heroes your captain picked:" );
-		for ( j = 0; j < count; j++ )
-		{
-			MOBA_Self( ent, "^3%2i^7 - %s (^5%s^7)%s",
-				j + 1, mobaHeroes[pool[j]].name, mobaHeroes[pool[j]].role,
-				MOBA_HeroTaken( pool[j] ) ? " ^8(taken)^7" : "" );
-		}
-		MOBA_Self( ent, "^3!pick N^7 takes one of them for you" );
-		return;
+		// only the pool of the team, but with the numbers of the full list so
+		// the window and the chat can never disagree about a hero
+		MOBA_Self( ent, "^3Heroes your captain picked for the %s team:",
+			team == TEAM_RED ? "^1red^7" : "^4blue^7" );
 	}
 
 	for ( i = 0; i < mobaNumHeroes; i++ )
 	{
 		const char *state = "";
+
+		if ( assign && mobaHeroBanned[i] )
+		{
+			continue;	// a banned hero is in no pool, the board already shows it
+		}
 
 		if ( mobaHeroBanned[i] )
 		{
@@ -2164,9 +2264,23 @@ static void MOBA_ListHeroes( gentity_t *ent )
 		{
 			state = " ^4(blue)^7";
 		}
+		else if ( assign && ( team == TEAM_RED || team == TEAM_BLUE ) )
+		{
+			continue;	// not picked by the captains, so not in this pool
+		}
+		else if ( assign && MOBA_HeroTaken( i ) )
+		{
+			// the pool listing has no colour to show, "taken" is the marker there
+			state = " ^8(taken)^7";
+		}
 
 		MOBA_Self( ent, "^3%2i^7 - %s (^5%s^7)%s",
 			i + 1, mobaHeroes[i].name, mobaHeroes[i].role, state );
+	}
+
+	if ( assign && ( team == TEAM_RED || team == TEAM_BLUE ) )
+	{
+		MOBA_Self( ent, "^3!pick N^7 takes one of them for you" );
 	}
 }
 
@@ -2417,12 +2531,14 @@ static void MOBA_ShowStatus( gentity_t *ent )
 // Draft commands
 //=========================================================================
 
-// The captain stage works on the full hero list, the assign stage on the pool of
-// the team, so the number the player typed has to be mapped through the pool
-// before it becomes a hero id.
+// Both stages work on the same numbering: N is the number the hero has in the
+// full list, which is also the number the client shows on its tile and the
+// number the assign stage draws the pool with. The pool is only a filter, not a
+// second index space, so a player cannot be told "3" by !heroes and have the
+// click on tile 3 mean something else.
 static qboolean MOBA_DraftHeroFromArg( gentity_t *ent, const char *arg, int *heroId )
 {
-	int id, pool[MOBA_MAX_HEROES], count;
+	int id;
 
 	if ( arg == NULL || arg[0] == '\0' )
 	{
@@ -2432,35 +2548,15 @@ static qboolean MOBA_DraftHeroFromArg( gentity_t *ent, const char *arg, int *her
 
 	id = atoi( arg ) - 1;
 
-	if ( mobaPhase != MOBA_PHASE_DRAFT_ASSIGN )
+	// "!pick 0" and a mistyped word both arrive here as -1, the hero array is
+	// indexed with the result
+	if ( id < 0 || id >= mobaNumHeroes )
 	{
-		// "!pick 0" and a mistyped word both arrive here as -1, the pool arrays
-		// are indexed with the result
-		if ( id < 0 || id >= mobaNumHeroes )
-		{
-			MOBA_CPSelf( ent, "Bad hero number! See: !heroes\n" );
-			return qfalse;
-		}
-
-		*heroId = id;
-		return qtrue;
-	}
-
-	if ( ent->client->sess.sessionTeam != TEAM_RED &&
-		ent->client->sess.sessionTeam != TEAM_BLUE )
-	{
-		MOBA_CPSelf( ent, "You are not playing this match.\n" );
+		MOBA_CPSelf( ent, "Bad hero number! See: !heroes\n" );
 		return qfalse;
 	}
 
-	count = MOBA_TeamPool( ent->client->sess.sessionTeam, pool, ARRAY_LEN( pool ) );
-	if ( id < 0 || id >= count )
-	{
-		MOBA_CPSelf( ent, "Bad number! See: !heroes\n" );
-		return qfalse;
-	}
-
-	*heroId = pool[id];
+	*heroId = id;
 	return qtrue;
 }
 
@@ -2507,7 +2603,14 @@ static void MOBA_DraftPick( gentity_t *ent, const char *arg )
 		return;
 	}
 
-	// assign stage: taking a hero of the pool of the team
+	// assign stage: taking a hero out of the pool of the team
+	if ( ent->client->sess.sessionTeam != TEAM_RED &&
+		ent->client->sess.sessionTeam != TEAM_BLUE )
+	{
+		MOBA_CPSelf( ent, "You are not playing this match.\n" );
+		return;
+	}
+
 	if ( mobaHeroBanned[heroId] || mobaHeroTeam[heroId] != ent->client->sess.sessionTeam )
 	{
 		MOBA_CPSelf( ent, "%s is not in the pool of your team! See: !heroes\n",
@@ -2669,194 +2772,18 @@ qboolean MOBA_HandleChat( gentity_t *ent, const char *msg )
 // Heroes - content table
 //=========================================================================
 
+
+// The hero definitions themselves live in moba_content.h so the cgame can
+// render the same numbers in the select window. The server works on its own
+// writable copy, everything that changes at runtime (ban, team, owner) is kept
+// in the mobaHeroBanned/mobaHeroTeam arrays next to the draft code.
 static void MOBA_LoadHeroes( void )
 {
-	static const mobaHero_t heroes[MOBA_MAX_HEROES] = {
-		{ "Ash'Lar",		"Tank",		950, 50, 100, 30, 2,
-		{ AB( "Piercing Blade",	AB_DIRECT,		6000,	90,	20,	900,	0,	0,	1.0f, "Hit target" ),
-		  AB( "Blade Wall",		AB_AOE_DAMAGE,	12000,	70,	15,	0,		450,	0,	1.0f, "Sweeping strike" ),
-		  AB( "Battle Rage",		AB_BUFF,		20000,	0,	0,	0,		0,		9000,	1.6f, "+60% dmg 9s" ),
-		  AB( "Earth Rift",		AB_AOE_DAMAGE,	30000,	150,	30,	0,		600,	0,	1.0f, "Powerful shock" ) } },
-
-		{ "Vectar",		"Tank",		920, 48, 100, 28, 2,
-		{ AB( "Thunder Hammer",		AB_DIRECT,		7000,	95,	18,	800,	0,	0,	1.0f, "Stunning blow" ),
-		  AB( "Stone Skin",		AB_BUFF,		18000,	0,	0,	0,		0,		10000,	1.35f, "+35% dmg 10s" ),
-		  AB( "Shockwave",			AB_AOE_DAMAGE,	11000,	60,	12,	0,		500,	0,	1.0f, "Area blast" ),
-		  AB( "Golem Wrath",		AB_AOE_DAMAGE,	28000,	130,	25,	0,		550,	0,	1.0f, "Shatter" ) } },
-
-		{ "T'Raine",		"Tank",		980, 55, 100, 26, 2,
-		{ AB( "Spike",				AB_DIRECT,		6500,	85,	16,	850,	0,	0,	1.0f, "Piercing thrust" ),
-		  AB( "Iron Ring",		AB_AOE_DAMAGE,	12000,	65,	14,	0,		450,	0,	1.0f, "Ring of damage" ),
-		  AB( "Unyielding",		AB_BUFF,		22000,	0,	0,	0,		0,		8000,	1.5f, "+50% dmg 8s" ),
-		  AB( "Meat Grinder",			AB_AOE_DAMAGE,	32000,	160,	35,	0,		500,	0,	1.0f, "Whirling storm" ) } },
-
-		{ "Korkhin",		"Mage",		560, 28, 50, 22, 2,
-		{ AB( "Lightning Lash",		AB_DIRECT,		6000,	110,	25,	1000,	0,	0,	1.0f, "Lightning at target" ),
-		  AB( "Fireball",		AB_AOE_DAMAGE,	10000,	85,	18,	0,		400,	0,	1.0f, "Explosion around self" ),
-		  AB( "Arc Chain",			AB_DIRECT,		9000,	125,	22,	950,	0,	0,	1.0f, "Strong discharge" ),
-		  AB( "Storm",				AB_AOE_DAMAGE,	35000,	200,	45,	0,		600,	0,	1.0f, "Area storm" ) } },
-
-		{ "Silvara",		"Mage",		540, 26, 50, 20, 2,
-		{ AB( "Ice Dagger",		AB_DIRECT,		5500,	105,	24,	1000,	0,	0,	1.0f, "Ice at target" ),
-		  AB( "Frost Breath",	AB_BUFF,		16000,	0,	0,	0,		0,		7000,	1.4f, "+40% dmg 7s" ),
-		  AB( "Hail",				AB_AOE_DAMAGE,	11000,	75,	16,	0,		450,	0,	1.0f, "Hail around" ),
-		  AB( "Eternal Winter",		AB_AOE_DAMAGE,	34000,	190,	40,	0,		550,	0,	1.0f, "Freezing storm" ) } },
-
-		{ "Merek",		"Mage",		580, 30, 55, 24, 2,
-		{ AB( "Spirit Fire",			AB_DIRECT,		6500,	115,	20,	950,	0,	0,	1.0f, "Flaming beam" ),
-		  AB( "Fire Cocktail",			AB_AOE_DAMAGE,	10000,	80,	20,	0,		420,	0,	1.0f, "Explosion" ),
-		  AB( "Flame Shield",		AB_BUFF,		20000,	0,	0,	0,		0,		9000,	1.55f, "+55% dmg 9s" ),
-		  AB( "Ash Rain",	AB_AOE_DAMAGE,	33000,	195,	42,	0,		580,	0,	1.0f, "Firestorm" ) } },
-
-		{ "Ornat",		"Mage",		520, 25, 50, 22, 2,
-		{ AB( "Acid Shot",	AB_DIRECT,		6000,	120,	28,	1000,	0,	0,	1.0f, "Acid" ),
-		  AB( "Rot Wave",		AB_AOE_DAMAGE,	11000,	70,	15,	0,		430,	0,	1.0f, "Rot around" ),
-		  AB( "Evil Eye",				AB_BUFF,		17000,	0,	0,	0,		0,		8000,	1.45f, "+45% dmg 8s" ),
-		  AB( "Plague Column",		AB_AOE_DAMAGE,	36000,	210,	50,	0,		600,	0,	1.0f, "Giant plague" ) } },
-
-		{ "Zum'Zar",		"Mage",		550, 27, 55, 22, 2,
-		{ AB( "Thunder Strike",		AB_DIRECT,		7000,	130,	26,	900,	0,	0,	1.0f, "Thunder" ),
-		  AB( "Thunderclap",			AB_AOE_DAMAGE,	11000,	78,	17,	0,		480,	0,	1.0f, "Shock wave" ),
-		  AB( "Energy Charge",		AB_BUFF,		19000,	0,	0,	0,		0,		8000,	1.5f, "+50% dmg 8s" ),
-		  AB( "Thunder Burst",		AB_AOE_DAMAGE,	32000,	180,	38,	0,		560,	0,	1.0f, "Sky rupture" ) } },
-
-		{ "Killian",		"Carry",	620, 32, 60, 35, 3,
-		{ AB( "Precision Shot",		AB_DIRECT,		5000,	100,	22,	1100,	0,	0,	1.0f, "Shot" ),
-		  AB( "Rapid Fire",	AB_BUFF,		14000,	0,	0,	0,		0,		6000,	1.5f, "+50% dmg 6s" ),
-		  AB( "Shrapnel",			AB_AOE_DAMAGE,	10000,	65,	14,	0,		380,	0,	1.0f, "Shards" ),
-		  AB( "Golden Bullet",		AB_DIRECT,		26000,	230,	50,	1200,	0,	0,	1.0f, "Lethal shot" ) } },
-
-		{ "Dinara",		"Carry",	600, 30, 65, 38, 3,
-		{ AB( "Twin Blades",		AB_DIRECT,		5500,	95,	20,	1000,	0,	0,	1.0f, "Double strike" ),
-		  AB( "Blade Dance",		AB_AOE_DAMAGE,	12000,	70,	15,	0,		420,	0,	1.0f, "Ring of blades" ),
-		  AB( "Blades of Greed",	AB_BUFF,		18000,	0,	0,	0,		0,		9000,	1.45f, "+45% dmg 9s" ),
-		  AB( "Hidden Slash",	AB_DIRECT,		28000,	210,	45,	1000,	0,	0,	1.0f, "Cutting sweep" ) } },
-
-		{ "Starr",		"Carry",	640, 34, 70, 36, 3,
-		{ AB( "Assault Volley",		AB_DIRECT,		5000,	85,	18,	1050,	0,	0,	1.0f, "Volley" ),
-		  AB( "Roaring Barrage",		AB_AOE_DAMAGE,	11000,	60,	15,	0,		400,	0,	1.0f, "Wave" ),
-		  AB( "Adrenaline",			AB_BUFF,		15000,	0,	0,	0,		0,		7000,	1.55f, "+55% dmg 7s" ),
-		  AB( "Burst Rounds",	AB_DIRECT,		27000,	220,	48,	1150,	0,	0,	1.0f, "Burst" ) } },
-
-		{ "Brock",		"Carry",	660, 35, 70, 34, 3,
-		{ AB( "Chopping Blow",		AB_DIRECT,		6000,	90,	19,	950,	0,	0,	1.0f, "Axe" ),
-		  AB( "Whirl",				AB_AOE_DAMAGE,	11000,	65,	14,	0,		420,	0,	1.0f, "Axe whirlwind" ),
-		  AB( "Beast Rage",	AB_BUFF,		17000,	0,	0,	0,		0,		8000,	1.5f, "+50% dmg 8s" ),
-		  AB( "Crusher",		AB_DIRECT,		30000,	240,	55,	1000,	0,	0,	1.0f, "All-out strike" ) } },
-
-		{ "Lira",		"Healer",	600, 30, 60, 22, 1,
-		{ AB( "Light Discipline",	AB_AOE_HEAL,	6000,	80,	15,	0,		600,	0,	1.0f, "Area heal" ),
-		  AB( "Ray of Hope",		AB_DIRECT,		8000,	70,	14,	950,	0,	0,	1.0f, "Beam" ),
-		  AB( "Blessing",		AB_BUFF,		18000,	0,	0,	0,		0,		9000,	1.4f, "+40% dmg 9s" ),
-		  AB( "Greater Heal",	AB_AOE_HEAL,	26000,	220,	40,	0,		700,	0,	1.0f, "Powerful heal" ) } },
-
-		{ "Selena",		"Healer",	580, 28, 55, 20, 1,
-		{ AB( "Wave of Life",		AB_AOE_HEAL,	6500,	75,	14,	0,		550,	0,	1.0f, "Heal" ),
-		  AB( "Light Spear",		AB_DIRECT,		7000,	80,	16,	1000,	0,	0,	1.0f, "Spear" ),
-		  AB( "Inspiration",		AB_BUFF,		20000,	0,	0,	0,		0,		10000,	1.35f, "+35% dmg 10s" ),
-		  AB( "Wound Refresh",	AB_AOE_HEAL,	25000,	200,	38,	0,		650,	0,	1.0f, "Full heal" ) } },
-
-		{ "Mornan",		"Healer",	640, 32, 65, 24, 1,
-		{ AB( "Balm",			AB_AOE_HEAL,		6000,	85,	16,	0,		580,	0,	1.0f, "Heal" ),
-		  AB( "Hammer of Fate",		AB_DIRECT,		8500,	90,	18,	900,	0,	0,	1.0f, "Hammer" ),
-		  AB( "Fortitude",			AB_BUFF,		19000,	0,	0,	0,		0,		9000,	1.3f, "+30% dmg 9s" ),
-		  AB( "Healer's Hands",		AB_AOE_HEAL,	24000,	240,	45,	0,		700,	0,	1.0f, "Full heal" ) } },
-
-		{ "Gillian",	"Assassin",	540, 26, 45, 40, 4,
-		{ AB( "Shadow Stab",			AB_DIRECT,		4500,	130,	30,	1000,	0,	0,	1.0f, "Stab" ),
-		  AB( "Shadow Blades",		AB_AOE_DAMAGE,	10000,	80,	18,	0,		400,	0,	1.0f, "Blade circles" ),
-		  AB( "Shadow Rage",		AB_BUFF,		14000,	0,	0,	0,		0,		6000,	1.6f, "+60% dmg 6s" ),
-		  AB( "Deadly Slash", AB_DIRECT,		24000,	250,	60,	1100,	0,	0,	1.0f, "Lethal strike" ) } },
-
-		{ "Kyra",		"Assassin",	520, 24, 45, 42, 4,
-		{ AB( "Backstab",		AB_DIRECT,		5000,	120,	28,	950,	0,	0,	1.0f, "Dagger" ),
-		  AB( "Blood Dance",		AB_AOE_DAMAGE,	10000,	75,	16,	0,		380,	0,	1.0f, "Dance" ),
-		  AB( "Hunter's Zeal",	AB_BUFF,		13000,	0,	0,	0,		0,		7000,	1.55f, "+55% dmg 7s" ),
-		  AB( "Piercing Shadow",	AB_DIRECT,		25000,	260,	55,	1150,	0,	0,	1.0f, "Shadow slash" ) } },
-
-		{ "Ravel",		"Assassin",	560, 27, 50, 38, 4,
-		{ AB( "Knife Whirl",		AB_DIRECT,		4800,	110,	26,	1050,	0,	0,	1.0f, "Whirl" ),
-		  AB( "Wind Blades",		AB_AOE_DAMAGE,	10000,	70,	15,	0,		420,	0,	1.0f, "Blades" ),
-		  AB( "Aggression",			AB_BUFF,		15000,	0,	0,	0,		0,		8000,	1.5f, "+50% dmg 8s" ),
-		  AB( "Deadly Storm",		AB_DIRECT,		23000,	230,	55,	1200,	0,	0,	1.0f, "Lethal storm" ) } },
-
-		{ "Ismara",		"Carry",	600, 31, 65, 37, 3,
-		{ AB( "Fire Volley",		AB_DIRECT,		5500,	105,	24,	1050,	0,	0,	1.0f, "Volley" ),
-		  AB( "Burst Fire",	AB_AOE_DAMAGE,	10000,	70,	15,	0,		400,	0,	1.0f, "Barrage" ),
-		  AB( "Warrior's Aim",		AB_BUFF,		16000,	0,	0,	0,		0,		7000,	1.45f, "+45% dmg 7s" ),
-		  AB( "Finishing Shot", AB_DIRECT,		25000,	225,	50,	1200,	0,	0,	1.0f, "Harpoon shot" ) } },
-
-		{ "Targo",		"Tank",		940, 48, 100, 30, 2,
-		{ AB( "Sledgehammer",			AB_DIRECT,		6500,	100,	20,	850,	0,	0,	1.0f, "Sledgehammer" ),
-		  AB( "Siege",				AB_AOE_DAMAGE,	13000,	75,	16,	0,		500,	0,	1.0f, "Siege" ),
-		  AB( "Armored Assault", AB_BUFF,		21000,	0,	0,	0,		0,		10000,	1.4f, "+40% dmg 10s" ),
-		  AB( "Demolition",			AB_AOE_DAMAGE,	30000,	145,	28,	0,		560,	0,	1.0f, "Demolition" ) } },
-
-		{ "Velia",		"Mage",		530, 26, 50, 20, 2,
-		{ AB( "Stardust",		AB_DIRECT,		5500,	115,	26,	1000,	0,	0,	1.0f, "Dust" ),
-		  AB( "Meteor",			AB_AOE_DAMAGE,	10500,	82,	18,	0,		430,	0,	1.0f, "Meteor" ),
-		  AB( "Star Rage",	AB_BUFF,		18000,	0,	0,	0,		0,		9000,	1.5f, "+50% dmg 9s" ),
-		  AB( "World Fall",		AB_AOE_DAMAGE,	34000,	205,	44,	0,		600,	0,	1.0f, "New worlds" ) } },
-
-		{ "Astarot",	"Assassin",	530, 25, 45, 44, 4,
-		{ AB( "Demonic Claw", AB_DIRECT,		4500,	135,	34,	1000,	0,	0,	1.0f, "Claw" ),
-		  AB( "Inferno Flame",		AB_AOE_DAMAGE,	9500,	85,	18,	0,		380,	0,	1.0f, "Flame" ),
-		  AB( "Bloodthirst",		AB_BUFF,		12000,	0,	0,	0,		0,		6000,	1.65f, "+65% dmg 6s" ),
-		  AB( "Death Ritual",		AB_DIRECT,		22000,	270,	65,	1100,	0,	0,	1.0f, "Lethal ritual" ) } },
-
-		{ "Belin",		"Healer",	620, 31, 60, 22, 1,
-		{ AB( "Healing Ring",	AB_AOE_HEAL,	5500,	70,	13,	0,		550,	0,	1.0f, "Ring" ),
-		  AB( "Ray of Light",			AB_DIRECT,		7500,	75,	15,	1000,	0,	0,	1.0f, "Beam" ),
-		  AB( "Prayer",			AB_BUFF,		20000,	0,	0,	0,		0,		10000,	1.3f, "+30% dmg 10s" ),
-		  AB( "Great Miracle",		AB_AOE_HEAL,	24000,	210,	40,	0,		700,	0,	1.0f, "Miracle" ) } },
-
-		{ "Draks",		"Tank",		960, 52, 100, 28, 2,
-		{ AB( "Fire Strike",		AB_DIRECT,		6000,	95,	20,	900,	0,	0,	1.0f, "Strike" ),
-		  AB( "Flame Circle",		AB_AOE_DAMAGE,	12000,	72,	15,	0,		460,	0,	1.0f, "Circle" ),
-		  AB( "Dragon Rage",	AB_BUFF,		19000,	0,	0,	0,		0,		8000,	1.55f, "+55% dmg 8s" ),
-		  AB( "Dragon Breath",	AB_AOE_DAMAGE,	31000,	160,	32,	0,		580,	0,	1.0f, "Flaming breath" ) } },
-
-		{ "Elfin",		"Carry",	580, 30, 60, 40, 3,
-		{ AB( "Rapid Shot",	AB_DIRECT,		5000,	95,	22,	1150,	0,	0,	1.0f, "Shot" ),
-		  AB( "Arrow Lightning",		AB_DIRECT,		9000,	140,	30,	1100,	0,	0,	1.0f, "Lightning" ),
-		  AB( "Swiftness",	AB_BUFF,		15000,	0,	0,	0,		0,		7000,	1.5f, "+50% dmg 7s" ),
-		  AB( "Dragon Shot",	AB_DIRECT,		24000,	215,	48,	1300,	0,	0,	1.0f, "Dragon arrow" ) } },
-
-		{ "Nomara",		"Mage",		550, 28, 55, 22, 2,
-		{ AB( "Water Wave",			AB_DIRECT,		6000,	100,	22,	1000,	0,	0,	1.0f, "Wave" ),
-		  AB( "Deluge",				AB_AOE_DAMAGE,	10000,	72,	16,	0,		440,	0,	1.0f, "Deluge" ),
-		  AB( "Power Surge",		AB_BUFF,		17000,	0,	0,	0,		0,		8000,	1.45f, "+45% dmg 8s" ),
-		  AB( "Ocean's Wrath",		AB_AOE_DAMAGE,	33000,	185,	40,	0,		570,	0,	1.0f, "Ocean" ) } },
-
-		{ "Quinn",		"Assassin",	510, 23, 40, 45, 4,
-		{ AB( "Claw Shadow",			AB_DIRECT,		4500,	140,	36,	1000,	0,	0,	1.0f, "Shadow claw" ),
-		  AB( "Shadow Storm",		AB_AOE_DAMAGE,	9500,	90,	20,	0,		400,	0,	1.0f, "Storm" ),
-		  AB( "Dark Grasp",		AB_BUFF,		11000,	0,	0,	0,		0,		6000,	1.7f, "+70% dmg 6s" ),
-		  AB( "Rending Claw", AB_DIRECT,		21000,	280,	70,	1100,	0,	0,	1.0f, "Burst" ) } },
-
-		{ "Charon",		"Tank",		970, 54, 100, 26, 2,
-		{ AB( "Bone Strike",		AB_DIRECT,		6500,	88,	17,	850,	0,	0,	1.0f, "Strike" ),
-		  AB( "Bone Wall",		AB_AOE_DAMAGE,	13000,	70,	14,	0,		470,	0,	1.0f, "Wall" ),
-		  AB( "Cold Wrath",		AB_BUFF,		20000,	0,	0,	0,		0,		9000,	1.5f, "+50% dmg 9s" ),
-		  AB( "Death and Bones",		AB_AOE_DAMAGE,	29000,	150,	30,	0,		540,	0,	1.0f, "Bone storm" ) } },
-
-		{ "Ignis",		"Mage",		520, 25, 50, 22, 2,
-		{ AB( "Spark",				AB_DIRECT,		5000,	120,	28,	1000,	0,	0,	1.0f, "Spark" ),
-		  AB( "Arson",				AB_AOE_DAMAGE,	9500,	85,	18,	0,		420,	0,	1.0f, "Arson" ),
-		  AB( "Burning Blood",		AB_BUFF,		15000,	0,	0,	0,		0,		7000,	1.5f, "+50% dmg 7s" ),
-		  AB( "Burning World",		AB_AOE_DAMAGE,	32000,	200,	42,	0,		600,	0,	1.0f, "World of fire" ) } },
-
-		{ "Valka",		"Healer",	630, 33, 65, 22, 1,
-		{ AB( "Healing Dew",		AB_AOE_HEAL,	5000,	70,	14,	0,		600,	0,	1.0f, "Dew" ),
-		  AB( "Ray of Dawn",			AB_DIRECT,		8000,	85,	17,	1000,	0,	0,	1.0f, "Beam" ),
-		  AB( "Dawn Charge",		AB_BUFF,		18000,	0,	0,	0,		0,		10000,	1.4f, "+40% dmg 10s" ),
-		  AB( "Daybreak",			AB_AOE_HEAL,		23000,	230,	42,	0,		700,	0,	1.0f, "Greater heal" ) } } };
-
 	int i;
 
 	for ( i = 0; i < MOBA_MAX_HEROES; i++ )
 	{
-		mobaHeroes[i] = heroes[i];
+		mobaHeroes[i] = mobaHeroTable[i];
 	}
 
 	mobaNumHeroes = MOBA_MAX_HEROES;
