@@ -186,6 +186,12 @@ XCVAR_DEF( moba_autodraftEvery,			"1000",			NULL,						CVAR_LATCH,										qtru
 XCVAR_DEF( moba_testkill,				"-1",			NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_testkick,				"-1",			NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_bots,					"0",				NULL,						CVAR_LATCH,										qtrue )
+// the hero selection mode: 0 = captain draft (two captains ban and pick the
+// lineup of their team), 1 = all pick (no bans, no captains, everybody takes any
+// free hero). The Create a game menu writes it through the game type, see
+// GT_MOBA_CAPTAIN / GT_MOBA_ALLPICK, so the cvar is the mode a plain team game
+// runs in and the fallback if the two are out of sync.
+XCVAR_DEF( moba_mode,					"1",			NULL,						CVAR_LATCH,										qtrue )
 // seconds per draft step: one ban or pick, and the window the whole team has to
 // take a hero out of its pool afterwards
 XCVAR_DEF( moba_pickTime,				"30",			NULL,						CVAR_LATCH,										qtrue )

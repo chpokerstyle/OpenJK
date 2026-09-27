@@ -514,6 +514,8 @@ static const char *gameTypes[GT_MAX_GAME_TYPE] = {
 	"Siege",
 	"CTF",
 	"CTY",
+	"MOBA Captain Draft",
+	"MOBA All Pick",
 };
 static const int numGameTypes = ARRAY_LEN( gameTypes );
 
@@ -1574,7 +1576,14 @@ static const char* UI_GetGameTypeName(int gtEnum)
 	case GT_CTF:
 		return UI_GetStringEdString("MENUS", "CAPTURE_THE_FLAG");//"Capture the Flag";
 	case GT_CTY:
-		return UI_GetStringEdString("MENUS", "CAPTURE_THE_YSALIMARI");//"Capture the Ysalamiri";
+		return UI_GetStringEdString("MENUS", "CAPTURE_THE_YSALIMIRI");//"Capture the Ysalamiri";
+	// MOBA mod (Magic Wands): the two modes the mod adds to this menu. They have
+	// no key in the string file, and UI_GetStringEdString returns an empty string
+	// for a key it cannot find, so the names are plain text here.
+	case GT_MOBA_CAPTAIN:
+		return "MOBA Captain Draft";
+	case GT_MOBA_ALLPICK:
+		return "MOBA All Pick";
 	}
 	return UI_GetStringEdString("MENUS", "SAGA");//"Team FFA";
 }

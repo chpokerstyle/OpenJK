@@ -3187,7 +3187,9 @@ const char *gametypeStringShort[GT_MAX_GAME_TYPE] = {
 	"TDM",
 	"SAGA",
 	"CTF",
-	"CTY"
+	"CTY",
+	"MOBAC",
+	"MOBAA"
 };
 
 const char *BG_GetGametypeString( int gametype )
@@ -3216,6 +3218,12 @@ const char *BG_GetGametypeString( int gametype )
 	case GT_CTY:
 		return "Capture The Ysalimiri";
 
+	// MOBA mod (Magic Wands), see g_moba.c
+	case GT_MOBA_CAPTAIN:
+		return "MOBA Captain Draft";
+	case GT_MOBA_ALLPICK:
+		return "MOBA All Pick";
+
 	default:
 		return "Unknown Gametype";
 	}
@@ -3237,5 +3245,10 @@ int BG_GetGametypeForString( const char *gametype )
 	else if ( !Q_stricmp( gametype, "siege" ) )			return GT_SIEGE;
 	else if ( !Q_stricmp( gametype, "ctf" ) )			return GT_CTF;
 	else if ( !Q_stricmp( gametype, "cty" ) )			return GT_CTY;
+	// MOBA mod, so "set g_gametype moba_allpick" works from the console
+	else if ( !Q_stricmp( gametype, "moba_captain" )
+			||!Q_stricmp( gametype, "mobacaptain" ) )	return GT_MOBA_CAPTAIN;
+	else if ( !Q_stricmp( gametype, "moba_allpick" )
+			||!Q_stricmp( gametype, "mobaallpick" ) )	return GT_MOBA_ALLPICK;
 	else												return -1;
 }

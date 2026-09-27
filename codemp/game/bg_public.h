@@ -245,6 +245,14 @@ typedef enum {
 	GT_SIEGE,			// siege
 	GT_CTF,				// capture the flag
 	GT_CTY,
+
+	//-- MOBA mod (Magic Wands) ----
+
+	// Two entries of the Create a game menu. g_moba.c reads them in G_InitGame,
+	// stores the mode in moba_mode and turns the game into a plain team game for
+	// the engine, so every other gametype check below keeps working on GT_TEAM.
+	GT_MOBA_CAPTAIN,	// two captains ban and pick the lineup of their team
+	GT_MOBA_ALLPICK,	// no bans and no captains, everybody takes a free hero
 	GT_MAX_GAME_TYPE
 } gametype_t;
 
@@ -261,7 +269,9 @@ typedef enum {
 #define GTB_SIEGE			0x080 // siege
 #define GTB_CTF				0x100 // capture the flag
 #define GTB_CTY				0x200 // capture the ysalimiri
-#define GTB_ALL				0x1FF // all
+#define GTB_MOBA_CAPTAIN	0x400 // MOBA mod: captain draft
+#define GTB_MOBA_ALLPICK	0x800 // MOBA mod: all pick
+#define GTB_ALL				0xFFF // all
 
 typedef enum _flag_status {
 	FLAG_ATBASE = 0,

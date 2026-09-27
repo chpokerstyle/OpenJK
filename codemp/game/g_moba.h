@@ -15,8 +15,11 @@ MagicWands MOBA mod - OpenJK game code (server-side)
 // ---- Captain draft ----
 // The draft runs once per match: three stages, each one bans
 // MOBA_DRAFT_BANS_PER_CAPTAIN heroes per captain and then picks
-// MOBA_DRAFT_PICKS_PER_STAGE per captain. What is left over after the second
-// stage is taken in the third one, which is the single pick of a 5v5.
+// MOBA_DRAFT_PICKS_PER_STAGE per captain. A captain picks one hero per player
+// on his team, so a captain of a five player team ends up with five heroes, and
+// a team that grows while the draft runs gets the missing picks appended to the
+// plan. All pick skips this plan entirely: no bans, no captain, every player
+// takes one hero off the same board.
 #define MOBA_DRAFT_STAGES			3
 #define MOBA_DRAFT_BANS_PER_CAPTAIN	2
 #define MOBA_DRAFT_PICKS_PER_STAGE	2

@@ -144,6 +144,10 @@ static int CG_Moba_CooldownLeft( int slot )
 #define CG_MOBA_ACT_BAN			1
 #define CG_MOBA_ACT_PICK		2
 
+// hero selection mode of the server, mirrors moba_mode of g_moba.c
+#define CG_MOBA_MODE_CAPTAIN	0		// captains ban and pick a team pool
+#define CG_MOBA_MODE_ALLPICK	1		// no bans, everybody takes a free hero
+
 typedef struct {
 	int			bannedMask;		// one bit per hero, index into mobaHeroTable
 	int			redMask;
@@ -156,6 +160,7 @@ typedef struct {
 	int			myHero;			// -1 while the player has no hero
 	int			myTeam;			// 0 none, 1 red, 2 blue (team_t on the server)
 	int			step, steps;
+	int			mode;			// CG_MOBA_MODE_*, hero selection mode of the server
 	int			phase;			// shop phase the draft state belongs to
 	qboolean	received;
 	qboolean	logged;			// one time confirmation in the client log
@@ -195,6 +200,15 @@ static qboolean CG_Moba_Selectable( int heroId )
 		return qfalse;
 	}
 
+	// All pick has no pools at all: the whole board is up for grabs and the hero
+	// leaves it for everybody as soon as one player owns it, which is what the
+	// taken mask above already says.
+	if ( cgMoba.phase == CG_MOBA_PHASE_DRAFT &&
+		cgMobaDraft.mode == CG_MOBA_MODE_ALLPICK )
+	{
+		return qtrue;
+	}
+
 	if ( cgMoba.phase == CG_MOBA_PHASE_DRAFT )
 	{
 		int gone;
@@ -216,16 +230,17 @@ static qboolean CG_Moba_Selectable( int heroId )
 
 //=========================================================================
 // Server command handler: "mobaDraft <banned> <red> <blue> <taken> <action>
-// <canAct> <seconds> <myHero> <myTeam> <step> <steps>". Thirty heroes fit into
-// one int, so the whole board travels in a single command and the window never
-// has to ask the server for a second opinion on what is already banned or
+// <canAct> <seconds> <myHero> <myTeam> <step> <steps> <mode>". Thirty heroes fit
+// into one int, so the whole board travels in a single command and the window
+// never has to ask the server for a second opinion on what is already banned or
 // picked. <taken> is what the team pool masks cannot say: who already has a
-// hero out of the pool.
+// hero out of the pool. <mode> says whether the board is a shared one (all pick)
+// or the pools of the two captains.
 //=========================================================================
 void CG_Moba_DraftCommand_f( void )
 {
 	char buf[128], *p;
-	int v[11], i;
+	int v[12], i;
 
 	if ( cg_moba.integer == 0 || !CG_Argv( 1 ) || !CG_Argv( 1 )[0] )
 	{
@@ -234,7 +249,7 @@ void CG_Moba_DraftCommand_f( void )
 
 	Q_strncpyz( buf, CG_Argv( 1 ), sizeof( buf ) );
 	p = buf;
-	for ( i = 0; i < 11; i++ )
+	for ( i = 0; i < 12; i++ )
 	{
 		v[i] = strtol( p, &p, 10 );
 		while ( *p == ' ' )
@@ -272,6 +287,7 @@ void CG_Moba_DraftCommand_f( void )
 	cgMobaDraft.myTeam = v[8];
 	cgMobaDraft.step = v[9];
 	cgMobaDraft.steps = v[10];
+	cgMobaDraft.mode = v[11];
 	cgMobaDraft.received = qtrue;
 
 	// a hero that the server just took away must not stay armed in the confirm
@@ -451,6 +467,14 @@ static const char *CG_Moba_HeroState( int heroId )
 	{
 		return "yours";
 	}
+	// all pick has no pools to show, so the only thing left to say about a hero
+	// is that somebody else already owns it
+	if ( cgMoba.phase == CG_MOBA_PHASE_DRAFT &&
+		cgMobaDraft.mode == CG_MOBA_MODE_ALLPICK &&
+		( cgMobaDraft.takenMask & ( 1 << heroId ) ) )
+	{
+		return "taken";
+	}
 
 	return NULL;
 }
@@ -561,8 +585,12 @@ static void CG_Moba_DraftAct( int heroId )
 
 	if ( !cgMobaDraft.canAct )
 	{
+		// all pick has no turn order, so a player that cannot act has his hero
+		// already and not a turn that has to come
 		Q_strncpyz( cgMobaDraft.notice,
-			( cgMoba.phase == CG_MOBA_PHASE_DRAFT ) ? "wait for your turn" : "you already have a hero",
+			( cgMoba.phase == CG_MOBA_PHASE_DRAFT &&
+				cgMobaDraft.mode != CG_MOBA_MODE_ALLPICK ) ?
+				"wait for your turn" : "you already have a hero",
 			sizeof( cgMobaDraft.notice ) );
 		cgMobaDraft.noticeUntil = cg.time + 2500;
 		return;
@@ -904,7 +932,8 @@ void CG_Moba_DrawDraft( void )
 
 	// ---- title bar ----
 	CG_Text_Paint( CG_MOBA_WIN_X + 8.0f, CG_MOBA_WIN_Y + 4.0f, 0.8f, colorTitle,
-		( cgMoba.phase == CG_MOBA_PHASE_DRAFT_ASSIGN ) ? "CHOOSE YOUR HERO" : "CAPTAIN DRAFT",
+		( cgMoba.phase == CG_MOBA_PHASE_DRAFT_ASSIGN ) ? "CHOOSE YOUR HERO" :
+		( cgMobaDraft.mode == CG_MOBA_MODE_ALLPICK ) ? "ALL PICK" : "CAPTAIN DRAFT",
 		0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_MEDIUM );
 
 	secondsLeft = cgMobaDraft.secondsLeft - ( cg.time - cgMobaDraft.receivedAt ) / 1000;
@@ -913,7 +942,22 @@ void CG_Moba_DrawDraft( void )
 		secondsLeft = 0;
 	}
 
-	if ( cgMoba.phase == CG_MOBA_PHASE_DRAFT )
+	if ( cgMoba.phase == CG_MOBA_PHASE_DRAFT &&
+		cgMobaDraft.mode == CG_MOBA_MODE_ALLPICK )
+	{
+		// all pick has no steps and no turn order, only the clock and the board
+		textY = CG_MOBA_WIN_Y + 20.0f;
+		CG_Text_Paint( CG_MOBA_WIN_X + 8.0f, textY, 0.62f,
+			( secondsLeft <= 5 ) ? colorRed : colorDim,
+			va( "pick any hero you like  -  %i s", secondsLeft ),
+			0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+		CG_Text_Paint( CG_MOBA_WIN_X + 8.0f, textY + 12.0f, 0.62f,
+			cgMobaDraft.canAct ? colorGold : colorDim,
+			cgMobaDraft.canAct ? "click a free hero - no captain in between" :
+				( cgMobaDraft.myHero >= 0 ? "you already picked a hero" : "waiting" ),
+			0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	}
+	else if ( cgMoba.phase == CG_MOBA_PHASE_DRAFT )
 	{
 		textY = CG_MOBA_WIN_Y + 20.0f;
 		CG_Text_Paint( CG_MOBA_WIN_X + 8.0f, textY, 0.62f,
