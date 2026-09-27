@@ -1,9 +1,9 @@
 /*
 ===========================================================================
-MagicWands MOBA mod - OpenJK cgame (on-screen shop)
+MagicWands MOBA mod - OpenJK cgame (hero window, shop window, ability bar)
 ===========================================================================
 The server pushes "mobaShop phase seconds gold itemMask level" to the client
-once per change. That is the only thing this file needs to know, so the panel
+once per change. That is the only thing the shop needs to know, so the window
 stays in sync with the authoritative game state without any guessing.
 ===========================================================================
 */
@@ -17,26 +17,29 @@ stays in sync with the authoritative game state without any guessing.
 //=========================================================================
 // Presentation copy of mobaItems from g_moba.c. The server stays the only
 // owner of the prices it actually charges, this table only has to render them.
-// The key column mirrors the binds in moba.cfg: the JKA client never hands key
-// codes to the cgame, so a bind writes a token into cg_mobaKey instead. The
-// keys are the ones the default JKA layout leaves free, digits and numpad stay
-// on weapons, movement and force powers.
+// The category is the index of the tab in cgMobaItemCats, one item belongs to
+// exactly one tab and the tiles inside a tab follow the order of this table.
 //=========================================================================
 typedef struct {
 	const char	*name;
 	int			price;
 	const char	*desc;
-	const char	*key;			// moba.cfg bind that buys this slot
-	vec4_t		chip;			// keycap colour, groups the items by kind
+	int			category;		// index into cgMobaItemCats
+	vec4_t		chip;			// tile colour, groups the items inside a tab
 } cgMobaItem_t;
 
+static const char *cgMobaItemCats[] = { "DEFENCE", "ATTACK", "CONSUMABLES" };
+#define CG_MOBA_ITEM_CATS	( (int)( sizeof( cgMobaItemCats ) / sizeof( cgMobaItemCats[0] ) ) )
+
+// The order is the order of mobaItems on the server, because the index of a row
+// is the bit the item mask uses, so the two tables may never be sorted apart.
 static const cgMobaItem_t cgMobaItems[] = {
-	{ "Sturdy Armor",	250,	"+50 armor",					"G",	{ 0.30f, 0.50f, 0.80f, 0.95f } },
-	{ "Med Kit",		200,	"+100 health",				"H",	{ 0.75f, 0.25f, 0.25f, 0.95f } },
-	{ "Rage Rune",		300,	"+20% damage",				"J",	{ 0.85f, 0.45f, 0.15f, 0.95f } },
-	{ "Heavy Plate",	500,	"+100 armor, +50 health",		"N",	{ 0.25f, 0.45f, 0.70f, 0.95f } },
-	{ "Power Crystal",	650,	"+50 health, +40% damage",	"X",	{ 0.60f, 0.30f, 0.75f, 0.95f } },
-	{ "Shadow Cloak",	400,	"+30 armor, +15% damage",		";",	{ 0.25f, 0.60f, 0.40f, 0.95f } }
+	{ "Sturdy Armor",	250,	"+50 armor",					0,	{ 0.30f, 0.50f, 0.80f, 0.95f } },
+	{ "Med Kit",		200,	"+100 health",				2,	{ 0.75f, 0.25f, 0.25f, 0.95f } },
+	{ "Rage Rune",		300,	"+20% damage",				1,	{ 0.85f, 0.45f, 0.15f, 0.95f } },
+	{ "Heavy Plate",	500,	"+100 armor, +50 health",		0,	{ 0.25f, 0.45f, 0.70f, 0.95f } },
+	{ "Power Crystal",	650,	"+50 health, +40% damage",	1,	{ 0.60f, 0.30f, 0.75f, 0.95f } },
+	{ "Shadow Cloak",	400,	"+30 armor, +15% damage",		0,	{ 0.25f, 0.60f, 0.40f, 0.95f } }
 };
 
 #define CG_MOBA_NUM_ITEMS	( (int)( sizeof( cgMobaItems ) / sizeof( cgMobaItems[0] ) ) )
@@ -61,7 +64,10 @@ typedef struct {
 	int			itemMask;
 	int			level;
 	int			noticeUntil;		// "only in the buy phase" message
+	int			category;		// tab of the shop window
+	int			cursor;			// grid slot under the keyboard cursor, -1 = none
 	qboolean	open;				// the player opened the shop with B
+	qboolean	hadCatcher;		// the window currently owns the mouse
 	qboolean	received;
 	qboolean	logged;			// one time confirmation in the client log
 } cgMobaState_t;
@@ -107,7 +113,7 @@ static int CG_Moba_CooldownLeft( int slot )
 // Hero select window
 //
 // The window is a modal panel: it takes the mouse from the game (see
-// CG_Moba_DraftCatcher) so the player can look at the board instead of at the
+// CG_Moba_Catcher) so the player can look at the board instead of at the
 // world, and it draws every hero of mobaHeroTable with the ban and pick state
 // the server pushed. Nothing here decides anything, a click only turns into
 // the same !pick / !ban command a player would type in chat.
@@ -330,35 +336,66 @@ static qboolean CG_Moba_DraftWanted( void )
 		cgMoba.phase == CG_MOBA_PHASE_DRAFT_ASSIGN ) ? qtrue : qfalse;
 }
 
+// The shop window is drawn at the end of this file, next to the state it reads.
+// Both windows want the mouse and draw a pointer, so the helpers that do that
+// are announced here.
+static qboolean CG_Moba_ShopOpen( void );
+
 //=========================================================================
 // The JKA client only hands key codes to the cgame while KEYCATCH_CGAME is set
 // (cl_keys.cpp CL_KeyEvent) and only feeds mouse deltas to CG_MouseEvent under
-// the same bit (cl_input.cpp IN_MouseMove). The window therefore has to hold
-// that bit, and it has to let it go again when it closes.
+// the same bit (cl_input.cpp IN_MouseMove). A window therefore has to hold that
+// bit, and it has to let it go again when it closes.
 //
-// ESC is the one key the client eats itself: it clears the bit and calls
-// CG_EventHandling before the cgame ever sees it (cl_keys.cpp, "escape always
-// gets out of CGAME stuff"). The draft may not be left half way through, so a
-// bit that disappears while the window still wants it is taken back on the next
-// frame instead of being read as a close request. The console key and
-// Shift+ESC are handled before that rule in the client, so a player can always
-// open the console, and the mouse look stays under the client as it was.
+// ESC is the one key the client eats itself: it never reaches the cgame at all,
+// it sets KEYCATCH_UI and opens the in game menu (cl_keys.cpp, "escape is always
+// handled special" and UI_InGameMenu). So the two windows read the same event
+// from opposite ends - a KEYCATCH_CGAME bit that disappeared while the window
+// still wanted it:
+//
+//   draft: the bit came back on a press of ESC. A draft step may not be left
+//          half way and the server has no undo, so the window takes the bit
+//          back on the next frame instead of reading it as a close request.
+//   shop:  that press is the close request the player asked for, so the window
+//          lets the bit go and the game menu opens as usual.
+//
+// The console key and Shift+ESC are handled before that rule in the client, so a
+// player can always open the console and the mouse look stays as it was.
 //=========================================================================
-static void CG_Moba_DraftCatcher( void )
+static void CG_Moba_Catcher( void )
 {
 	int catcher = trap->Key_GetCatcher();
-	qboolean want = CG_Moba_DraftWanted();
+	qboolean hasBit = ( catcher & KEYCATCH_CGAME ) ? qtrue : qfalse;
+	qboolean draft = CG_Moba_DraftWanted();
+	qboolean shop = CG_Moba_ShopOpen();
 
-	if ( want && !( catcher & KEYCATCH_CGAME ) )
+	if ( !cg_moba.integer || ( !draft && !shop ) )
 	{
-		trap->Key_SetCatcher( catcher | KEYCATCH_CGAME );
-		cgMobaDraft.hadCatcher = qtrue;
-	}
-	else if ( !want && ( catcher & KEYCATCH_CGAME ) && cgMobaDraft.hadCatcher )
-	{
-		trap->Key_SetCatcher( catcher & ~KEYCATCH_CGAME );
+		if ( hasBit && ( cgMobaDraft.hadCatcher || cgMoba.hadCatcher ) )
+		{
+			trap->Key_SetCatcher( catcher & ~KEYCATCH_CGAME );
+		}
+
 		cgMobaDraft.hadCatcher = qfalse;
+		cgMoba.hadCatcher = qfalse;
+		return;
 	}
+
+	if ( !hasBit )
+	{
+		if ( shop && cgMoba.hadCatcher )
+		{
+			// ESC took the bit: the shop is done, the menu that came with it stays
+			cgMoba.open = qfalse;
+			cgMoba.hadCatcher = qfalse;
+			return;
+		}
+
+		trap->Key_SetCatcher( catcher | KEYCATCH_CGAME );
+	}
+
+	cgMobaDraft.hadCatcher = draft;
+	cgMoba.hadCatcher = shop;
 }
 
 //=========================================================================
@@ -471,6 +508,9 @@ static qboolean CG_Moba_ButtonAt( float mx, float my )
 // while the game has the mouse, so a window that wants a pointer has to paint
 // one itself. Built from plain rectangles: no shader to load, and it stays
 // crisp because every edge lands on a whole pixel.
+//
+// The pointer belongs to both windows, so it is drawn for whichever one has the
+// mouse right now.
 //=========================================================================
 static void CG_Moba_DrawCursor( void )
 {
@@ -480,7 +520,7 @@ static void CG_Moba_DrawCursor( void )
 	float y = (float)cgs.cursorY;
 	int i;
 
-	if ( !cg_moba.integer || !CG_Moba_DraftWanted() )
+	if ( !cg_moba.integer || !( CG_Moba_DraftWanted() || CG_Moba_ShopOpen() ) )
 	{
 		return;
 	}
@@ -579,6 +619,18 @@ static int CG_Moba_BarAt( float mx, float my );
 static void CG_Moba_CastAbility( int slot );
 
 //=========================================================================
+// The shop window is a window like the draft, so it has its own click handling.
+// A purchase spends gold the player cannot get back this phase, but the server
+// is the one that decides: the click only sends the !buy a player would type,
+// and the tile is only lit when the server would accept it right now.
+//=========================================================================
+static int CG_Moba_ShopTabAt( float mx, float my );
+static int CG_Moba_ShopTileAt( float mx, float my );
+static void CG_Moba_ShopAct( int item );
+static qboolean CG_Moba_ShopBuyable( int item );
+static void CG_Moba_ShopMoveCursor( int dx, int dy );
+
+//=========================================================================
 // Input. Runs before the cgame decides what a key is for, because a living
 // local player would otherwise swallow every key and every mouse button.
 // Returns qtrue when the window used the key, so the game never acts on it.
@@ -589,7 +641,7 @@ static void CG_Moba_CastAbility( int slot );
 //=========================================================================
 qboolean CG_Moba_KeyEvent( int key, qboolean down )
 {
-	int hero, slot;
+	int hero, slot, item, tab;
 
 	if ( !down )
 	{
@@ -608,6 +660,50 @@ qboolean CG_Moba_KeyEvent( int key, qboolean down )
 			CG_Moba_CastAbility( slot );
 			return qtrue;
 		}
+	}
+
+	// The shop has the mouse, so every click belongs to it. ESC never gets here
+	// (the client eats it), CG_Moba_Catcher reads the closed shop out of the
+	// catcher bit the client took away.
+	if ( CG_Moba_ShopOpen() )
+	{
+		switch ( key )
+		{
+		case A_MOUSE1:
+			tab = CG_Moba_ShopTabAt( (float)cgs.cursorX, (float)cgs.cursorY );
+			if ( tab >= 0 )
+			{
+				cgMoba.category = tab;
+			}
+			else
+			{
+				item = CG_Moba_ShopTileAt( (float)cgs.cursorX, (float)cgs.cursorY );
+				CG_Moba_ShopAct( item );
+			}
+			return qtrue;
+
+		case A_CURSOR_LEFT:
+			CG_Moba_ShopMoveCursor( -1, 0 );
+			return qtrue;
+
+		case A_CURSOR_RIGHT:
+			CG_Moba_ShopMoveCursor( 1, 0 );
+			return qtrue;
+
+		case A_CURSOR_UP:
+			CG_Moba_ShopMoveCursor( 0, -1 );
+			return qtrue;
+
+		case A_CURSOR_DOWN:
+			CG_Moba_ShopMoveCursor( 0, 1 );
+			return qtrue;
+
+		case A_ENTER:
+			CG_Moba_ShopAct( CG_Moba_ShopTileAt( (float)cgs.cursorX, (float)cgs.cursorY ) );
+			return qtrue;
+		}
+
+		return qtrue;
 	}
 
 	if ( !CG_Moba_DraftWanted() )
@@ -796,7 +892,7 @@ void CG_Moba_DrawDraft( void )
 
 	// the catcher has to be serviced every frame, also while the window is
 	// closed, otherwise the mouse would stay locked in a panel nobody can see
-	CG_Moba_DraftCatcher();
+	CG_Moba_Catcher();
 
 	if ( !CG_Moba_DraftWanted() )
 	{
@@ -1156,10 +1252,12 @@ void CG_Moba_ServerCommand_f( void )
 //=========================================================================
 static const char *cgMobaAbilityKeys[CG_MOBA_ABILITIES] = { "Q", "E", "C", "V" };
 
-#define CG_MOBA_BAR_SIZE		44.0f
-#define CG_MOBA_BAR_GAP		6.0f
-// high enough that the name under the boxes is not cut off by the bottom edge
-#define CG_MOBA_BAR_Y		( 480.0f - 70.0f )
+// The bar is a corner of the screen, not the middle of it: a quarter of the
+// height of a box would cover the fight the player is trying to watch.
+#define CG_MOBA_BAR_SIZE		22.0f
+#define CG_MOBA_BAR_GAP		4.0f
+// high enough that a slot and the line above it both stay on screen
+#define CG_MOBA_BAR_Y		( 480.0f - 44.0f )
 
 // left edge of a slot, the bar is centred under the crosshair
 static float CG_Moba_BarX( int slot )
@@ -1324,17 +1422,35 @@ static void CG_Moba_DrawAbilityBar( void )
 	static vec4_t colorShade	= { 0.00f, 0.00f, 0.00f, 0.65f };
 	static vec4_t colorKey		= { 1.00f, 0.85f, 0.30f, 1.00f };
 	static vec4_t colorText		= { 1.00f, 1.00f, 1.00f, 1.00f };
-	static vec4_t colorName		= { 0.75f, 0.75f, 0.75f, 1.00f };
+	static vec4_t colorName		= { 0.80f, 0.80f, 0.80f, 1.00f };
 	static vec4_t colorDim		= { 0.60f, 0.60f, 0.60f, 1.00f };
 
 	const mobaHero_t *hero = &mobaHeroTable[cgMobaAb.heroId];
 	const mobaAbility_t *ab;
 	float x, w;
-	int i, left, rank;
+	int i, left, rank, hover;
 
 	if ( !CG_Moba_BarWanted() )
 	{
 		return;
+	}
+
+	// the name of one slot only: four names under four small boxes would run
+	// into each other and hide the fight behind them
+	hover = CG_Moba_BarAt( (float)cgs.cursorX, (float)cgs.cursorY );
+
+	if ( hover >= 0 )
+	{
+		const char *tip;
+
+		ab = &hero->abilities[hover];
+		left = CG_Moba_CooldownLeft( hover );
+		tip = ( left > 0 ) ? va( "%s  -  %i s", ab->name, ( left + 999 ) / 1000 ) : ab->name;
+
+		w = (float)CG_Text_Width( tip, 0.6f, FONT_SMALL );
+		CG_Text_Paint( ( 640.0f - w ) * 0.5f, CG_MOBA_BAR_Y - 12.0f, 0.6f,
+			( left > 0 ) ? colorDim : colorName, tip, 0, 0,
+			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 	}
 
 	for ( i = 0; i < CG_MOBA_ABILITIES; i++ )
@@ -1348,17 +1464,17 @@ static void CG_Moba_DrawAbilityBar( void )
 		CG_DrawRect( x, CG_MOBA_BAR_Y, CG_MOBA_BAR_SIZE, CG_MOBA_BAR_SIZE, 1.0f,
 			( left > 0 ) ? colorWait : colorReady );
 
-		CG_Moba_AbilityIcon( x + 9.0f, CG_MOBA_BAR_Y + 9.0f, 26.0f, ab,
+		CG_Moba_AbilityIcon( x + 5.0f, CG_MOBA_BAR_Y + 5.0f, 12.0f, ab,
 			( left > 0 ) ? 0.35f : 1.0f );
 
-		// the key in the corner and the rank under the icon, so the player can
-		// see at a glance what is on which key and what he upgraded
-		CG_Text_Paint( x + 3.0f, CG_MOBA_BAR_Y + 1.0f, 0.62f, colorKey,
+		// the key in the corner and the rank next to it, so the player can see at
+		// a glance what is on which key and what he upgraded
+		CG_Text_Paint( x + 1.0f, CG_MOBA_BAR_Y, 0.42f, colorKey,
 			cgMobaAbilityKeys[i], 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 
 		if ( rank > 0 )
 		{
-			CG_Text_Paint( x + CG_MOBA_BAR_SIZE - 12.0f, CG_MOBA_BAR_Y + 1.0f, 0.55f,
+			CG_Text_Paint( x + CG_MOBA_BAR_SIZE - 7.0f, CG_MOBA_BAR_Y, 0.42f,
 				colorText, va( "%i", rank ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 		}
 
@@ -1366,7 +1482,7 @@ static void CG_Moba_DrawAbilityBar( void )
 		{
 			// the part of the icon that is still on cooldown, counted from the
 			// top, and the seconds left on top of it
-			float frac = (float)ab->cooldownMs > 0.0f ?
+			float frac = ( (float)ab->cooldownMs > 0.0f ) ?
 				(float)left / (float)ab->cooldownMs : 0.0f;
 
 			if ( frac > 1.0f )
@@ -1377,18 +1493,11 @@ static void CG_Moba_DrawAbilityBar( void )
 			CG_FillRect( x + 1.0f, CG_MOBA_BAR_Y + 1.0f, CG_MOBA_BAR_SIZE - 2.0f,
 				( CG_MOBA_BAR_SIZE - 2.0f ) * frac, colorShade );
 
-			w = (float)CG_Text_Width( va( "%i", ( left + 999 ) / 1000 ), 0.7f, FONT_SMALL );
-			CG_Text_Paint( x + ( CG_MOBA_BAR_SIZE - w ) * 0.5f, CG_MOBA_BAR_Y + 16.0f,
-				0.7f, colorText, va( "%i", ( left + 999 ) / 1000 ), 0, 0,
+			w = (float)CG_Text_Width( va( "%i", ( left + 999 ) / 1000 ), 0.55f, FONT_SMALL );
+			CG_Text_Paint( x + ( CG_MOBA_BAR_SIZE - w ) * 0.5f, CG_MOBA_BAR_Y + 6.0f,
+				0.55f, colorText, va( "%i", ( left + 999 ) / 1000 ), 0, 0,
 				ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 		}
-
-		// the name under the box, shortened to what fits
-		CG_Text_Paint( x + ( CG_MOBA_BAR_SIZE -
-				(float)CG_Text_Width( ab->name, 0.5f, FONT_SMALL ) ) * 0.5f,
-			CG_MOBA_BAR_Y + CG_MOBA_BAR_SIZE + 1.0f, 0.5f,
-			( left > 0 ) ? colorDim : colorName, ab->name, 0, 0,
-			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 	}
 }
 
@@ -1489,16 +1598,17 @@ static qboolean CG_Moba_ShopOpen( void )
 //=========================================================================
 // Input. The JKA client never hands raw key codes to the cgame: keys are turned
 // into buttons before they reach the vm, so the cgame's CG_KEY_EVENT is dead
-// code and a cgame side key hook can never see "B" or "1". Instead the binds
-// in moba.cfg write a token into the cg_mobaKey cvar and the panel reacts to
-// the change once per frame:
+// code and a cgame side key hook can never see "B". Instead the bind in
+// moba.cfg writes a token into the cg_mobaKey cvar and the window reacts to the
+// change once per frame:
 //
-//   b  - open or close the shop
-//   1..6 - buy that slot and close the shop again
+//   b - open or close the shop
 //
-// Escape never reaches a bind: cl_keys.cpp handles it before CL_ParseBinding
-// and opens the game menu instead (that is also why no token can close the
-// panel from the client side). B closes it again.
+// Escape never reaches a bind: cl_keys.cpp handles it before CL_ParseBinding and
+// opens the game menu instead, so the cgame never sees that key. ESC closing the
+// shop is read out of the catcher bit the client took away, see CG_Moba_Catcher.
+// Everything inside the window is the mouse, plus the arrow keys and Enter,
+// which do arrive while the window holds KEYCATCH_CGAME.
 //=========================================================================
 static void CG_Moba_HandleToken( const char *token )
 {
@@ -1507,33 +1617,20 @@ static void CG_Moba_HandleToken( const char *token )
 		if ( CG_Moba_CanShop() )
 		{
 			cgMoba.open = !cgMoba.open;
+
+			// a new opening starts on the first tab and forgets the keyboard
+			// cursor, the shop of the last round is not where this one is
+			if ( cgMoba.open )
+			{
+				cgMoba.category = 0;
+				cgMoba.cursor = -1;
+			}
 		}
 		else
 		{
 			// say why nothing happened instead of a dead key press
 			cgMoba.noticeUntil = cg.time + 2500;
 		}
-
-		return;
-	}
-
-	if ( token[0] >= '1' && token[0] <= '6' && !token[1] )
-	{
-		if ( CG_Moba_ShopOpen() )
-		{
-			// the vm console command queue has no separator, so the newline has
-			// to be part of every command the cgame sends (cl_cgame.cpp
-			// Cbuf_AddText), otherwise it merges with the next one
-			//
-			// "cmd say ..." instead of a plain "say ...": the client only
-			// forwards a console command to the server after the cgame, the ui
-			// and the cvar lookups have all declined it, and "cmd" skips that
-			// chain completely (cl_main.cpp CL_ForwardToServer_f)
-			trap->SendConsoleCommand( va( "cmd say !buy %c\n", token[0] ) );
-			cgMoba.open = qfalse;	// one item per shop opening
-		}
-
-		return;
 	}
 }
 
@@ -1556,40 +1653,391 @@ static void CG_Moba_Input( void )
 }
 
 //=========================================================================
-// Draws the shop in the upper left corner, over the HUD but under the chat
-// box. Prices are right aligned with CG_Text_Width because the JKA font is
-// proportional and would break a fixed column layout. The hero window owns the
-// other phases and is drawn first, the two can never be on screen together.
+// Shop window
+//
+// A window like the hero window: it takes the mouse while it is open, has
+// three tabs for the three groups of items and buys with a left click. The
+// server owns the price it charges and answers a refused purchase with the
+// reason, so this only ever sends the !buy a player would type.
+//
+// The geometry is fixed, so every hit test is a rectangle compare. Prices are
+// right aligned with CG_Text_Width because the JKA font is proportional and
+// would break a fixed column layout.
+//=========================================================================
+#define CG_MOBA_SHOP_X			60.0f
+#define CG_MOBA_SHOP_Y			100.0f
+#define CG_MOBA_SHOP_W			520.0f
+#define CG_MOBA_SHOP_H			252.0f
+
+#define CG_MOBA_TAB_H			18.0f
+#define CG_MOBA_TAB_Y			( CG_MOBA_SHOP_Y + 40.0f )
+#define CG_MOBA_TAB_GAP			2.0f
+#define CG_MOBA_TAB_W			( ( CG_MOBA_SHOP_W - 20.0f - 2.0f * CG_MOBA_TAB_GAP ) / 3.0f )
+
+// three by two tiles is what six items need, and the most any group holds today
+#define CG_MOBA_SHOP_COLS		3
+#define CG_MOBA_SHOP_ROWS		2
+#define CG_MOBA_SHOP_TILE_W		( ( CG_MOBA_SHOP_W - 20.0f - 8.0f ) / 3.0f )
+#define CG_MOBA_SHOP_TILE_H		60.0f
+#define CG_MOBA_SHOP_TILE_GAP	4.0f
+#define CG_MOBA_SHOP_TILE_Y		( CG_MOBA_TAB_Y + CG_MOBA_TAB_H + 6.0f )
+#define CG_MOBA_SHOP_SLOTS		( CG_MOBA_SHOP_COLS * CG_MOBA_SHOP_ROWS )
+
+static float CG_Moba_TabX( int tab )
+{
+	return CG_MOBA_SHOP_X + 10.0f + tab * ( CG_MOBA_TAB_W + CG_MOBA_TAB_GAP );
+}
+
+static float CG_Moba_ShopTileX( int slot )
+{
+	return CG_MOBA_SHOP_X + 10.0f + ( slot % CG_MOBA_SHOP_COLS ) *
+		( CG_MOBA_SHOP_TILE_W + CG_MOBA_SHOP_TILE_GAP );
+}
+
+static float CG_Moba_ShopTileY( int slot )
+{
+	return CG_MOBA_SHOP_TILE_Y + ( slot / CG_MOBA_SHOP_COLS ) *
+		( CG_MOBA_SHOP_TILE_H + CG_MOBA_SHOP_TILE_GAP );
+}
+
+// the item of a grid slot, -1 when this group has fewer items than that slot
+static int CG_Moba_ShopItem( int slot )
+{
+	int i, seen = 0;
+
+	for ( i = 0; i < CG_MOBA_NUM_ITEMS; i++ )
+	{
+		if ( cgMobaItems[i].category != cgMoba.category )
+		{
+			continue;
+		}
+
+		if ( seen == slot )
+		{
+			return i;
+		}
+
+		seen++;
+	}
+
+	return -1;
+}
+
+//=========================================================================
+// Hit tests
+//=========================================================================
+static int CG_Moba_ShopTabAt( float mx, float my )
+{
+	int i;
+
+	for ( i = 0; i < CG_MOBA_ITEM_CATS; i++ )
+	{
+		float x = CG_Moba_TabX( i );
+
+		if ( mx >= x && mx < x + CG_MOBA_TAB_W &&
+			my >= CG_MOBA_TAB_Y && my < CG_MOBA_TAB_Y + CG_MOBA_TAB_H )
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+static int CG_Moba_ShopTileAt( float mx, float my )
+{
+	int slot;
+
+	for ( slot = 0; slot < CG_MOBA_SHOP_SLOTS; slot++ )
+	{
+		float x = CG_Moba_ShopTileX( slot );
+		float y = CG_Moba_ShopTileY( slot );
+
+		if ( mx >= x && mx < x + CG_MOBA_SHOP_TILE_W &&
+			my >= y && my < y + CG_MOBA_SHOP_TILE_H )
+		{
+			return CG_Moba_ShopItem( slot );
+		}
+	}
+
+	return -1;
+}
+
+//=========================================================================
+// Would the server take this purchase right now? Only the look of a tile
+// depends on it, the click always asks the server, which owns the price.
+//=========================================================================
+static qboolean CG_Moba_ShopBuyable( int item )
+{
+	if ( item < 0 || item >= CG_MOBA_NUM_ITEMS )
+	{
+		return qfalse;
+	}
+
+	if ( cgMoba.itemMask & ( 1 << item ) )
+	{
+		return qfalse;
+	}
+
+	return ( cgMoba.gold >= cgMobaItems[item].price ) ? qtrue : qfalse;
+}
+
+static void CG_Moba_ShopAct( int item )
+{
+	if ( !CG_Moba_ShopBuyable( item ) )
+	{
+		return;
+	}
+
+	// The vm console command queue has no separator, so the newline has to be
+	// part of every command the cgame sends (cl_cgame.cpp Cbuf_AddText),
+	// otherwise it merges with the next one.
+	//
+	// "cmd say ..." instead of a plain "say ...": the client only forwards a
+	// console command to the server after the cgame, the ui and the cvar lookups
+	// have all declined it, and "cmd" skips that chain completely (cl_main.cpp
+	// CL_ForwardToServer_f).
+	trap->SendConsoleCommand( va( "cmd say !buy %i\n", item + 1 ) );
+}
+
+// The keyboard cursor is a grid slot, so the arrow keys walk the same tiles the
+// mouse walks and Enter stands in for a click. The cursor jumps back to the
+// first tile of a group when the tab changes underneath it.
+static void CG_Moba_ShopMoveCursor( int dx, int dy )
+{
+	int slot = cgMoba.cursor;
+	int col, row;
+
+	if ( slot < 0 )
+	{
+		slot = 0;
+	}
+	else
+	{
+		col = ( slot % CG_MOBA_SHOP_COLS ) + dx;
+		row = ( slot / CG_MOBA_SHOP_COLS ) + dy;
+
+		if ( col < 0 )
+		{
+			col = CG_MOBA_SHOP_COLS - 1;
+		}
+		else if ( col >= CG_MOBA_SHOP_COLS )
+		{
+			col = 0;
+		}
+
+		if ( row < 0 )
+		{
+			row = CG_MOBA_SHOP_ROWS - 1;
+		}
+		else if ( row >= CG_MOBA_SHOP_ROWS )
+		{
+			row = 0;
+		}
+
+		slot = row * CG_MOBA_SHOP_COLS + col;
+	}
+
+	// stop on the last tile that really has an item, an empty tile would take
+	// the cursor away from everything
+	while ( slot > 0 && CG_Moba_ShopItem( slot ) < 0 )
+	{
+		slot--;
+	}
+
+	cgMoba.cursor = slot;
+}
+
+static void CG_Moba_DrawShop( void )
+{
+	static vec4_t colorWindow		= { 0.02f, 0.02f, 0.05f, 0.90f };
+	static vec4_t colorBorder		= { 0.60f, 0.50f, 0.20f, 0.95f };
+	static vec4_t colorTitle		= { 1.00f, 0.85f, 0.30f, 1.00f };
+	static vec4_t colorText			= { 1.00f, 1.00f, 1.00f, 1.00f };
+	static vec4_t colorDim			= { 0.65f, 0.65f, 0.65f, 1.00f };
+	static vec4_t colorHint			= { 0.60f, 0.60f, 0.60f, 1.00f };
+	static vec4_t colorPhase		= { 0.70f, 0.70f, 0.70f, 1.00f };
+	static vec4_t colorUrgent		= { 1.00f, 0.35f, 0.35f, 1.00f };
+	static vec4_t colorGold		= { 1.00f, 0.85f, 0.25f, 1.00f };
+	static vec4_t colorPrice		= { 0.40f, 0.90f, 0.40f, 1.00f };
+	static vec4_t colorPriceOwned	= { 0.35f, 0.50f, 0.35f, 1.00f };
+	static vec4_t colorPricePoor	= { 0.95f, 0.30f, 0.30f, 1.00f };
+	static vec4_t colorBought		= { 0.90f, 0.40f, 0.40f, 1.00f };
+	static vec4_t colorTabOff		= { 0.14f, 0.14f, 0.18f, 0.90f };
+	static vec4_t colorTabOn		= { 0.30f, 0.26f, 0.10f, 0.95f };
+	static vec4_t colorTileBg		= { 0.10f, 0.10f, 0.14f, 0.85f };
+	static vec4_t colorTileHover	= { 0.20f, 0.20f, 0.28f, 0.95f };
+
+	float x, y, textY, w;
+	vec4_t phaseColor;
+	int i, slot, item, secondsLeft, hover;
+
+	if ( !CG_Moba_ShopOpen() )
+	{
+		return;
+	}
+
+	hover = CG_Moba_ShopTileAt( (float)cgs.cursorX, (float)cgs.cursorY );
+
+	CG_FillRect( CG_MOBA_SHOP_X, CG_MOBA_SHOP_Y, CG_MOBA_SHOP_W, CG_MOBA_SHOP_H, colorWindow );
+	CG_DrawRect( CG_MOBA_SHOP_X, CG_MOBA_SHOP_Y, CG_MOBA_SHOP_W, CG_MOBA_SHOP_H, 1.0f, colorBorder );
+
+	// ---- title bar: name on the left, how long the phase lasts on the right ----
+	CG_Text_Paint( CG_MOBA_SHOP_X + 10.0f, CG_MOBA_SHOP_Y + 4.0f, 0.8f, colorTitle,
+		"MAGIC WANDS SHOP", 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_MEDIUM );
+
+	secondsLeft = cgMoba.secondsLeft - ( cg.time - cgMoba.receivedAt ) / 1000;
+	if ( secondsLeft < 0 )
+	{
+		secondsLeft = 0;
+	}
+
+	// the last seconds of the buy phase blink and turn red, a phase that runs
+	// out silently is the easiest way to lose a purchase
+	for ( i = 0; i < 4; i++ )
+	{
+		phaseColor[i] = ( secondsLeft <= 5 ) ? colorUrgent[i] : colorPhase[i];
+	}
+
+	if ( secondsLeft <= 5 )
+	{
+		phaseColor[3] = 0.35f + 0.65f * ( 0.5f + 0.5f * sin( cg.time * 0.009f ) );
+	}
+
+	{
+		const char *clock = va( "%i s left", secondsLeft );
+
+		w = (float)CG_Text_Width( clock, 0.7f, FONT_SMALL );
+		CG_Text_Paint( CG_MOBA_SHOP_X + CG_MOBA_SHOP_W - 10.0f - w, CG_MOBA_SHOP_Y + 7.0f,
+			0.7f, phaseColor, clock, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	}
+
+	// ---- gold and level ----
+	textY = CG_MOBA_SHOP_Y + 21.0f;
+	CG_Text_Paint( CG_MOBA_SHOP_X + 10.0f, textY, 0.75f,
+		( cgMoba.gold > 0 ) ? colorGold : colorUrgent,
+		va( "Gold: %i", cgMoba.gold ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_MEDIUM );
+	CG_Text_Paint( CG_MOBA_SHOP_X + 90.0f, textY + 2.0f, 0.65f, colorDim,
+		va( "level %i", cgMoba.level ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+
+	// ---- the three tabs ----
+	for ( i = 0; i < CG_MOBA_ITEM_CATS; i++ )
+	{
+		qboolean on = ( i == cgMoba.category ) ? qtrue : qfalse;
+		float tw = (float)CG_Text_Width( cgMobaItemCats[i], 0.7f, FONT_SMALL );
+
+		x = CG_Moba_TabX( i );
+		CG_FillRect( x, CG_MOBA_TAB_Y, CG_MOBA_TAB_W, CG_MOBA_TAB_H, on ? colorTabOn : colorTabOff );
+		CG_DrawRect( x, CG_MOBA_TAB_Y, CG_MOBA_TAB_W, CG_MOBA_TAB_H, 1.0f, colorBorder );
+		CG_Text_Paint( x + ( CG_MOBA_TAB_W - tw ) * 0.5f, CG_MOBA_TAB_Y + 1.0f, 0.7f,
+			on ? colorTitle : colorDim, cgMobaItemCats[i], 0, 0,
+			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	}
+
+	// ---- the tiles of the open tab ----
+	for ( slot = 0; slot < CG_MOBA_SHOP_SLOTS; slot++ )
+	{
+		const cgMobaItem_t *it;
+		const char *price;
+		vec4_t chip;
+		float *tileBorder;
+		qboolean owned, buyable;
+		int c;
+
+		item = CG_Moba_ShopItem( slot );
+		if ( item < 0 )
+		{
+			continue;
+		}
+
+		it = &cgMobaItems[item];
+		owned = ( cgMoba.itemMask & ( 1 << item ) ) ? qtrue : qfalse;
+		buyable = CG_Moba_ShopBuyable( item );
+
+		x = CG_Moba_ShopTileX( slot );
+		y = CG_Moba_ShopTileY( slot );
+
+		tileBorder = colorBorder;
+		if ( hover == item || slot == cgMoba.cursor )
+		{
+			tileBorder = colorTitle;
+		}
+		else if ( !buyable )
+		{
+			tileBorder = colorDim;
+		}
+
+		CG_FillRect( x, y, CG_MOBA_SHOP_TILE_W, CG_MOBA_SHOP_TILE_H,
+			( hover == item ) ? colorTileHover : colorTileBg );
+		CG_DrawRect( x, y, CG_MOBA_SHOP_TILE_W, CG_MOBA_SHOP_TILE_H, 1.0f, tileBorder );
+
+		// the colour of the group: the chip turns grey once the item is owned
+		for ( c = 0; c < 4; c++ )
+		{
+			chip[c] = it->chip[c];
+		}
+
+		if ( owned )
+		{
+			chip[0] *= 0.35f;
+			chip[1] *= 0.35f;
+			chip[2] *= 0.35f;
+		}
+
+		CG_FillRect( x + 6.0f, y + 8.0f, 16.0f, 16.0f, chip );
+		CG_DrawRect( x + 6.0f, y + 8.0f, 16.0f, 16.0f, 1.0f, tileBorder );
+
+		// name and price share the first line, the price right aligned
+		w = (float)CG_Text_Width( it->name, 0.7f, FONT_SMALL );
+		price = owned ? "bought" : va( "%ig", it->price );
+		CG_Text_Paint( x + 28.0f, y + 6.0f, 0.7f,
+			owned ? colorPriceOwned : colorText, it->name, 0, 0,
+			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+		CG_Text_Paint( x + CG_MOBA_SHOP_TILE_W - 8.0f -
+				(float)CG_Text_Width( price, 0.7f, FONT_SMALL ),
+			y + 6.0f, 0.7f,
+			owned ? colorBought : ( buyable ? colorPrice : colorPricePoor ),
+			price, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+
+		// a longer name must never run into the price column
+		if ( w + 40.0f > CG_MOBA_SHOP_TILE_W )
+		{
+			continue;
+		}
+
+		CG_Text_Paint( x + 28.0f, y + 22.0f, 0.6f,
+			owned ? colorDim : colorText, it->desc, 0, 0,
+			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+
+		// what a click on this tile would do, so no manual is needed
+		CG_Text_Paint( x + 28.0f, y + 38.0f, 0.6f,
+			owned ? colorDim : ( buyable ? colorPrice : colorPricePoor ),
+			owned ? "in your inventory" :
+				( buyable ? "left click - buy" : "not enough gold" ), 0, 0,
+			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	}
+
+	// ---- bottom line ----
+	CG_Text_Paint( CG_MOBA_SHOP_X + 10.0f, CG_MOBA_SHOP_Y + CG_MOBA_SHOP_H - 18.0f, 0.7f,
+		colorHint, "left click - buy    arrows and Enter work too    B or ESC - close",
+		0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+}
+
+//=========================================================================
+// Everything the mod draws, in the order the panels stack: the hero window and
+// the shop are the two modal windows and only one of them can be open, the
+// ability bar lives in the buy and the fight phase and the pointer goes on top
+// of every window that has the mouse.
 //=========================================================================
 void CG_Moba_Draw( void )
 {
-	static vec4_t colorBackground = { 0.0f, 0.0f, 0.0f, 0.55f };
-	static vec4_t colorBorder = { 0.6f, 0.5f, 0.2f, 0.9f };
-	static vec4_t colorTitle = { 1.0f, 0.85f, 0.3f, 1.0f };
-	static vec4_t colorPhase = { 0.7f, 0.7f, 0.7f, 1.0f };
-	static vec4_t colorUrgent = { 1.0f, 0.35f, 0.35f, 1.0f };
-	static vec4_t colorNormal = { 1.0f, 1.0f, 1.0f, 1.0f };
-	static vec4_t colorPoor = { 0.65f, 0.55f, 0.55f, 1.0f };
-	static vec4_t colorOwned = { 0.5f, 0.5f, 0.5f, 1.0f };
-	static vec4_t colorPrice = { 0.4f, 0.9f, 0.4f, 1.0f };
-	static vec4_t colorPriceOwned = { 0.35f, 0.5f, 0.35f, 1.0f };
-	static vec4_t colorPricePoor = { 0.95f, 0.3f, 0.3f, 1.0f };
-	static vec4_t colorBought = { 0.9f, 0.4f, 0.4f, 1.0f };
-	static vec4_t colorGold = { 1.0f, 0.85f, 0.25f, 1.0f };
-	static vec4_t colorHint = { 0.65f, 0.65f, 0.65f, 1.0f };
-	static vec4_t colorCap = { 1.0f, 1.0f, 1.0f, 1.0f };
-
-	const float panelWidth = 272.0f;
-	const float rowHeight = 15.0f;
-	const float titleHeight = 18.0f;
-	const float keySize = 11.0f;
-	float x = 16.0f, y = 80.0f, w = panelWidth;
-	float panelHeight, textY, priceX, tagX;
-	int i, secondsLeft;
+	static vec4_t colorHint	= { 0.65f, 0.65f, 0.65f, 1.0f };
+	static vec4_t colorPhase = { 0.70f, 0.70f, 0.70f, 1.00f };
 
 	// the catcher is serviced here as well, a window that is not on screen has
 	// to give the mouse back
 	CG_Moba_DrawDraft();
+	CG_Moba_DrawShop();
 
 	// the cursor goes last, on top of every panel the window drew
 	CG_Moba_DrawCursor();
@@ -1597,8 +2045,8 @@ void CG_Moba_Draw( void )
 	CG_Moba_Input();
 	CG_Moba_AbilityInput();
 
-	// the ability bar belongs to the bottom of the screen and the shop panel to
-	// the upper left, so they can be on screen together
+	// the ability bar belongs to the bottom of the screen, the shop window to
+	// the middle of it, so they can be on screen together
 	CG_Moba_DrawAbilityBar();
 
 	if ( !CG_Moba_ShopOpen() )
@@ -1615,114 +2063,5 @@ void CG_Moba_Draw( void )
 				"the shop only opens during the buy phase", 0, 0,
 				ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 		}
-
-		return;
 	}
-
-	panelHeight = titleHeight + rowHeight * ( CG_MOBA_NUM_ITEMS + 2 ) + 8.0f;
-
-	CG_FillRect( x, y, w, panelHeight, colorBackground );
-	CG_DrawRect( x, y, w, panelHeight, 1.0f, colorBorder );
-
-	textY = y + 4.0f;
-	CG_Text_Paint( x + 8.0f, textY, 0.8f, colorTitle, "MAGIC WANDS SHOP", 0, 0,
-		ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_MEDIUM );
-
-	secondsLeft = cgMoba.secondsLeft - ( cg.time - cgMoba.receivedAt ) / 1000;
-	if ( secondsLeft < 0 )
-	{
-		secondsLeft = 0;
-	}
-
-	// the last seconds of the buy phase blink and turn red, a phase that runs
-	// out silently is the easiest way to lose a purchase
-	{
-		vec4_t phaseColor;
-		qboolean urgent = ( secondsLeft <= 5 ) ? qtrue : qfalse;
-		int c;
-
-		for ( c = 0; c < 4; c++ )
-		{
-			phaseColor[c] = urgent ? colorUrgent[c] : colorPhase[c];
-		}
-
-		if ( urgent )
-		{
-			phaseColor[3] = 0.35f + 0.65f * ( 0.5f + 0.5f * sin( cg.time * 0.009f ) );
-		}
-
-		textY += titleHeight;
-		CG_Text_Paint( x + 8.0f, textY, 0.7f, phaseColor,
-			va( "Buy phase - %i s left - level %i", secondsLeft, cgMoba.level ),
-			0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
-	}
-
-	textY += rowHeight;
-
-	// the price column sits 46px in from the right edge, the bought tag 8px
-	priceX = x + w - 46.0f;
-	tagX = x + w - 8.0f;
-
-	for ( i = 0; i < CG_MOBA_NUM_ITEMS; i++ )
-	{
-		const cgMobaItem_t *item = &cgMobaItems[i];
-		qboolean owned = ( cgMoba.itemMask & ( 1 << i ) ) ? qtrue : qfalse;
-		qboolean poor = ( !owned && item->price > cgMoba.gold ) ? qtrue : qfalse;
-		const char *label = item->name;
-		const char *price = va( "%ig", item->price );
-		float labelW = (float)CG_Text_Width( label, 0.7f, FONT_SMALL );
-		float priceW = (float)CG_Text_Width( price, 0.7f, FONT_SMALL );
-		float keyW = (float)CG_Text_Width( item->key, 0.7f, FONT_SMALL );
-		float *rowColor = owned ? colorOwned : ( poor ? colorPoor : colorNormal );
-		vec4_t chipColor;
-		int c;
-
-		for ( c = 0; c < 4; c++ )
-		{
-			chipColor[c] = item->chip[c];
-		}
-
-		if ( labelW + priceW + 76.0f > w )
-		{
-			continue;	// never let a longer name overlap the price column
-		}
-
-		if ( owned )
-		{
-			chipColor[0] *= 0.35f;
-			chipColor[1] *= 0.35f;
-			chipColor[2] *= 0.35f;
-		}
-
-		// keycap: the coloured square is the item icon, the letter on it is
-		// the key that buys it, so the panel is readable without a manual
-		CG_FillRect( x + 6.0f, textY - 1.0f, keySize, keySize, chipColor );
-		CG_DrawRect( x + 6.0f, textY - 1.0f, keySize, keySize, 1.0f, colorBorder );
-		CG_Text_Paint( x + 6.0f + ( keySize - keyW ) * 0.5f, textY, 0.7f, colorCap,
-			item->key, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
-
-		CG_Text_Paint( x + 6.0f + keySize + 5.0f, textY, 0.7f, rowColor, label, 0, 0,
-			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
-		CG_Text_Paint( priceX - priceW, textY, 0.7f,
-			owned ? colorPriceOwned : ( poor ? colorPricePoor : colorPrice ), price,
-			0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
-
-		if ( owned )
-		{
-			const char *tag = "bought";
-			float tagW = (float)CG_Text_Width( tag, 0.7f, FONT_SMALL );
-
-			CG_Text_Paint( tagX - tagW, textY, 0.7f, colorBought, tag, 0, 0,
-				ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
-		}
-
-		textY += rowHeight;
-	}
-
-	CG_Text_Paint( x + 8.0f, textY, 0.75f,
-		( cgMoba.gold > 0 ) ? colorGold : colorUrgent,
-		va( "Gold: %i", cgMoba.gold ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_MEDIUM );
-
-	CG_Text_Paint( x + 8.0f, textY + rowHeight, 0.7f, colorHint,
-		"buy G H J N X ;    B close", 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 }

@@ -93,13 +93,16 @@ static int MOBA_TeamSeat( team_t team )
 mobaHero_t mobaHeroes[MOBA_MAX_HEROES];
 int mobaNumHeroes = 0;
 
+// The category is the group the client shows as a tab, and it has to match
+// cgMobaItemCats in cg_moba.c. The order of this table is the order of the item
+// mask, so the two tables may never be sorted apart.
 mobaItem_t mobaItems[] = {
-	{ "Sturdy Armor",	"armor",	"ARMOR",	250,	50,	0,	0,	"+50 armor" },
-	{ "Med Kit",		"med",		"HEAL",		200,	0,	100, 0,	"+100 health" },
-	{ "Rage Rune",		"rage",		"POWER",	300,	0,	0,	20,	"+20% damage" },
-	{ "Heavy Plate",	"heavy",	"ARMOR",	500,	100, 50, 0,	"+100 armor, +50 health" },
-	{ "Power Crystal",	"crystal",	"POWER",	650,	0,	50,	40,	"+50 health, +40% damage" },
-	{ "Shadow Cloak",	"cloak",	"ARMOR",	400,	30,	0,	15,	"+30 armor, +15% damage" }
+	{ "Sturdy Armor",	"armor",	"DEFENCE",		250,	50,	0,	0,	"+50 armor" },
+	{ "Med Kit",		"med",		"CONSUMABLES",	200,	0,	100, 0,	"+100 health" },
+	{ "Rage Rune",		"rage",		"ATTACK",	300,	0,	0,	20,	"+20% damage" },
+	{ "Heavy Plate",	"heavy",	"DEFENCE",		500,	100, 50, 0,	"+100 armor, +50 health" },
+	{ "Power Crystal",	"crystal",	"ATTACK",	650,	0,	50,	40,	"+50 health, +40% damage" },
+	{ "Shadow Cloak",	"cloak",	"DEFENCE",		400,	30,	0,	15,	"+30 armor, +15% damage" }
 };
 int mobaNumItems = ARRAY_LEN( mobaItems );
 
@@ -1967,8 +1970,8 @@ void MOBA_OnClientSpawn( gentity_t *ent )
 		mobaPlayers[ent->s.number].greeted = qtrue;
 		MOBA_CPSelf( ent, "^3Magic Wands^7: !heroes - hero list,\n"
 			"^3!pick N^7 - hero, ^3!ban N^7 - draft ban,\n"
-			"^3B^7 - open the shop panel in the buy phase,\n"
-			"^3G H J N X ;^7 - buy an item, ^3B^7 - close it,\n"
+			"^3B^7 - open or close the shop window in the buy phase,\n"
+			"^3ESC^7 closes the shop, a left click buys the item under it,\n"
 			"!buy N|code - buy, !buyall - buy everything affordable,\n"
 			"!upgrade N - upgrade ability, ^3Q E C V^7 - abilities on the bar,\n"
 			"!buyback - return after death, !status - stats, !help - all commands\n" );
@@ -2913,8 +2916,9 @@ qboolean MOBA_HandleChat( gentity_t *ent, const char *msg )
 			"^3Draft:^7 the two captains get !ban N and !pick N, everybody takes one "
 			"hero out of the pool of his team afterwards, ^3!draft^7 brings the hero "
 			"window back\n"
-			"^3The shop is the on screen panel:^7 press ^3B^7 in the buy phase, "
-			"^3G H J N X ;^7 buys an item, ^3B^7 closes it" );
+			"^3The shop is a window:^7 press ^3B^7 in the buy phase, pick a tab "
+			"(^3Defence^7, ^3Attack^7, ^3Consumables^7) and buy with a left click, "
+			"^3B^7 or ^3ESC^7 closes it" );
 		return qtrue;
 	}
 	if ( !Q_stricmp( cmd, "!draft" ) )
