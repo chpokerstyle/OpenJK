@@ -1403,7 +1403,7 @@ static void MOBA_PushDraftState( int clientNum )
 {
 	gentity_t *ent = &g_entities[clientNum];
 	char buf[128];
-	int banned = 0, red = 0, blue = 0, i, action, canAct, secs;
+	int banned = 0, red = 0, blue = 0, taken = 0, i, action, canAct, secs, myTeam;
 
 	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ||
 		!ent->inuse || !ent->client ||
@@ -1420,7 +1420,8 @@ static void MOBA_PushDraftState( int clientNum )
 		if ( mobaLastDraftSent[clientNum][0] != '\0' )
 		{
 			mobaLastDraftSent[clientNum][0] = '\0';
-			trap->SendServerCommand( ent->s.number, "mobaDraft \"0 0 0 0 0 0 -1 0 0\"" );
+			trap->SendServerCommand( ent->s.number,
+				"mobaDraft \"0 0 0 0 0 0 0 0 -1 0 0\"" );
 		}
 		return;
 	}
@@ -1438,6 +1439,17 @@ static void MOBA_PushDraftState( int clientNum )
 		else if ( mobaHeroTeam[i] == TEAM_BLUE )
 		{
 			blue |= ( 1 << i );
+		}
+	}
+
+	// the pool masks only say which heroes a team may hand out, not which of them
+	// a player already took. Without this the window cannot tell a free hero from
+	// a taken one and the confirm button would offer a hero the server refuses.
+	for ( i = 0; i < MAX_CLIENTS; i++ )
+	{
+		if ( mobaPlayers[i].inuse && mobaPlayers[i].heroId >= 0 && mobaPlayers[i].heroId < MOBA_MAX_HEROES )
+		{
+			taken |= ( 1 << mobaPlayers[i].heroId );
 		}
 	}
 
@@ -1466,10 +1478,11 @@ static void MOBA_PushDraftState( int clientNum )
 	}
 
 	secs = ( mobaPhaseEnd > level.time ) ? ( mobaPhaseEnd - level.time + 999 ) / 1000 : 0;
+	myTeam = ent->client->sess.sessionTeam;
 
-	Com_sprintf( buf, sizeof( buf ), "%i %i %i %i %i %i %i %i %i",
-		banned, red, blue, action, canAct, secs,
-		mobaPlayers[clientNum].heroId, mobaDraftStep, mobaDraftPlanLen );
+	Com_sprintf( buf, sizeof( buf ), "%i %i %i %i %i %i %i %i %i %i %i",
+		banned, red, blue, taken, action, canAct, secs,
+		mobaPlayers[clientNum].heroId, myTeam, mobaDraftStep, mobaDraftPlanLen );
 
 	if ( Q_stricmp( buf, mobaLastDraftSent[clientNum] ) != 0 )
 	{
@@ -2703,9 +2716,27 @@ qboolean MOBA_HandleChat( gentity_t *ent, const char *msg )
 		MOBA_Self( ent, "^3Commands:^7 !heroes !pick N !ban N !buy N|code !buyall !upgrade N "
 			"!buyback !1-!4 (abilities) !status\n"
 			"^3Draft:^7 the two captains get !ban N and !pick N, everybody takes one "
-			"hero out of the pool of his team afterwards\n"
+			"hero out of the pool of his team afterwards, ^3!draft^7 brings the hero "
+			"window back\n"
 			"^3The shop is the on screen panel:^7 press ^3B^7 in the buy phase, "
 			"^3G H J N X ;^7 buys an item, ^3B^7 closes it" );
+		return qtrue;
+	}
+	if ( !Q_stricmp( cmd, "!draft" ) )
+	{
+		// ESC cannot close the hero window any more, this is the way back for the
+		// cases the client cannot see, a window that got lost on a cgame reload or
+		// a client that joined in the middle of a phase
+		if ( mobaPhase != MOBA_PHASE_DRAFT && mobaPhase != MOBA_PHASE_DRAFT_ASSIGN )
+		{
+			MOBA_Self( ent, "^3No draft is running^7 - the window opens by itself at "
+				"the start of the next draft\n" );
+			return qtrue;
+		}
+
+		trap->SendServerCommand( ent->s.number, "mobaDraftOpen" );
+		MOBA_Self( ent, "^3The hero window is back.^7 It stays open until the draft "
+			"is over\n" );
 		return qtrue;
 	}
 	if ( !Q_stricmp( cmd, "!heroes" ) )

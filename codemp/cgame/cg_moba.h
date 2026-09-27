@@ -17,6 +17,7 @@ any guessing.
 // Called from the server command table in cg_servercmds.c.
 void		CG_Moba_ServerCommand_f( void );
 void		CG_Moba_DraftCommand_f( void );
+void		CG_Moba_DraftOpen_f( void );		// "mobaDraftOpen", server side !draft
 // Called from CG_Draw2D, handles the shop keys and draws both panels.
 void		CG_Moba_Draw( void );
 // Called from CG_KeyEvent in cg_newDraw.c before it decides what a key means.

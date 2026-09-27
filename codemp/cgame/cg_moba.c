@@ -79,7 +79,7 @@ static cgMobaState_t cgMoba;
 #define CG_MOBA_WIN_X			20.0f
 #define CG_MOBA_WIN_Y			28.0f
 #define CG_MOBA_WIN_W			600.0f
-#define CG_MOBA_WIN_H			404.0f
+#define CG_MOBA_WIN_H			428.0f
 
 #define CG_MOBA_COLS			5
 #define CG_MOBA_ROWS			6
@@ -92,6 +92,12 @@ static cgMobaState_t cgMoba;
 #define CG_MOBA_INFO_X			( CG_MOBA_GRID_X + CG_MOBA_COLS * ( CG_MOBA_TILE_W + CG_MOBA_TILE_GAP ) + 8.0f )
 #define CG_MOBA_INFO_W			( CG_MOBA_WIN_X + CG_MOBA_WIN_W - 8.0f - CG_MOBA_INFO_X )
 
+// the confirm button sits under the board, a left click on a tile only arms it
+#define CG_MOBA_BTN_X			( CG_MOBA_WIN_X + 8.0f )
+#define CG_MOBA_BTN_Y			( CG_MOBA_WIN_Y + CG_MOBA_WIN_H - 32.0f )
+#define CG_MOBA_BTN_W			214.0f
+#define CG_MOBA_BTN_H			24.0f
+
 #define CG_MOBA_ACT_NONE		0
 #define CG_MOBA_ACT_BAN			1
 #define CG_MOBA_ACT_PICK		2
@@ -100,18 +106,21 @@ typedef struct {
 	int			bannedMask;		// one bit per hero, index into mobaHeroTable
 	int			redMask;
 	int			blueMask;
+	int			takenMask;		// heroes a player has already taken
 	int			action;			// CG_MOBA_ACT_*, what the current step is
 	int			canAct;			// only the server may answer this
 	int			secondsLeft;
 	int			receivedAt;
 	int			myHero;			// -1 while the player has no hero
+	int			myTeam;			// 0 none, 1 red, 2 blue (team_t on the server)
 	int			step, steps;
 	int			phase;			// shop phase the draft state belongs to
 	qboolean	received;
 	qboolean	logged;			// one time confirmation in the client log
 	qboolean	hadCatcher;		// the window currently owns the mouse
-	qboolean	dismissed;		// ESC closed it until the next phase
+	qboolean	dismissed;		// only the !draft command clears this
 	int			cursor;			// keyboard cursor, -1 = nothing
+	int			selected;		// hero the confirm button would act on
 	char		notice[64];
 	int			noticeUntil;
 } cgMobaDraft_t;
@@ -119,15 +128,56 @@ typedef struct {
 static cgMobaDraft_t cgMobaDraft;
 
 //=========================================================================
-// Server command handler: "mobaDraft <banned> <red> <blue> <action> <canAct>
-// <seconds> <myHero> <step> <steps>". Thirty heroes fit into one int, so the
-// whole board travels in a single command and the window never has to ask the
-// server for a second opinion on what is already banned or picked.
+// May this hero be the one the confirm button acts on? The server has the last
+// word, this only decides whether the button lights up, and it is why a hero
+// that just got banned or taken disappears from the button instead of failing
+// with an error after the click.
+//=========================================================================
+static qboolean CG_Moba_Selectable( int heroId )
+{
+	int pool;
+
+	if ( heroId < 0 || heroId >= MOBA_MAX_HEROES || !cgMobaDraft.canAct ||
+		cgMobaDraft.action == CG_MOBA_ACT_NONE )
+	{
+		return qfalse;
+	}
+
+	if ( cgMobaDraft.bannedMask & ( 1 << heroId ) )
+	{
+		return qfalse;
+	}
+
+	if ( cgMobaDraft.takenMask & ( 1 << heroId ) )
+	{
+		return qfalse;
+	}
+
+	if ( cgMoba.phase == CG_MOBA_PHASE_DRAFT )
+	{
+		// the captains take heroes off the board, both masks are what is gone
+		return ( cgMobaDraft.redMask & cgMobaDraft.blueMask & ( 1 << heroId ) ) ? qfalse : qtrue;
+	}
+
+	// the assign stage hands out heroes out of the pool of the own team
+	pool = ( cgMobaDraft.myTeam == 1 ) ? cgMobaDraft.redMask :
+		( cgMobaDraft.myTeam == 2 ) ? cgMobaDraft.blueMask : 0;
+
+	return ( pool & ( 1 << heroId ) ) ? qtrue : qfalse;
+}
+
+//=========================================================================
+// Server command handler: "mobaDraft <banned> <red> <blue> <taken> <action>
+// <canAct> <seconds> <myHero> <myTeam> <step> <steps>". Thirty heroes fit into
+// one int, so the whole board travels in a single command and the window never
+// has to ask the server for a second opinion on what is already banned or
+// picked. <taken> is what the team pool masks cannot say: who already has a
+// hero out of the pool.
 //=========================================================================
 void CG_Moba_DraftCommand_f( void )
 {
 	char buf[128], *p;
-	int v[9], i;
+	int v[11], i;
 
 	if ( cg_moba.integer == 0 || !CG_Argv( 1 ) || !CG_Argv( 1 )[0] )
 	{
@@ -136,7 +186,7 @@ void CG_Moba_DraftCommand_f( void )
 
 	Q_strncpyz( buf, CG_Argv( 1 ), sizeof( buf ) );
 	p = buf;
-	for ( i = 0; i < 9; i++ )
+	for ( i = 0; i < 11; i++ )
 	{
 		v[i] = strtol( p, &p, 10 );
 		while ( *p == ' ' )
@@ -154,25 +204,34 @@ void CG_Moba_DraftCommand_f( void )
 		cgMobaDraft.phase = cgMoba.phase;
 		cgMobaDraft.dismissed = qfalse;
 		cgMobaDraft.cursor = -1;
+		cgMobaDraft.selected = -1;
 
-		// A new phase always gives the player a second chance, but the mouse bit
-		// decides how the window is currently held: still set means it stayed
-		// open across the phase change, clear means the player closed it with
-		// ESC and only the ESC has to be forgotten.
+		// A new phase always clears the choice, and the mouse bit decides how the
+		// window is currently held: still set means it kept the mouse across the
+		// phase change, clear means it has to take it again.
 		cgMobaDraft.hadCatcher = ( trap->Key_GetCatcher() & KEYCATCH_CGAME ) ? qtrue : qfalse;
 	}
 
 	cgMobaDraft.bannedMask = v[0];
 	cgMobaDraft.redMask = v[1];
 	cgMobaDraft.blueMask = v[2];
-	cgMobaDraft.action = v[3];
-	cgMobaDraft.canAct = v[4];
-	cgMobaDraft.secondsLeft = v[5];
+	cgMobaDraft.takenMask = v[3];
+	cgMobaDraft.action = v[4];
+	cgMobaDraft.canAct = v[5];
+	cgMobaDraft.secondsLeft = v[6];
 	cgMobaDraft.receivedAt = cg.time;
-	cgMobaDraft.myHero = v[6];
-	cgMobaDraft.step = v[7];
-	cgMobaDraft.steps = v[8];
+	cgMobaDraft.myHero = v[7];
+	cgMobaDraft.myTeam = v[8];
+	cgMobaDraft.step = v[9];
+	cgMobaDraft.steps = v[10];
 	cgMobaDraft.received = qtrue;
+
+	// a hero that the server just took away must not stay armed in the confirm
+	// button, or a late click would send a command for a hero nobody can have
+	if ( cgMobaDraft.selected >= 0 && !CG_Moba_Selectable( cgMobaDraft.selected ) )
+	{
+		cgMobaDraft.selected = -1;
+	}
 
 	if ( !cgMobaDraft.logged )
 	{
@@ -182,8 +241,41 @@ void CG_Moba_DraftCommand_f( void )
 }
 
 //=========================================================================
+// Safety net for "the window is gone and I cannot get it back". ESC can no
+// longer close it, but the server command costs nothing and covers the cases
+// the client cannot see, a cgame that was restarted with a stale catcher, a
+// window the player lost on another machine state. Fired by the !draft chat
+// command of the server.
+//=========================================================================
+void CG_Moba_DraftOpen_f( void )
+{
+	if ( !cg_moba.integer || !cgMobaDraft.received )
+	{
+		return;
+	}
+
+	// the window only exists during the two draft phases, reopening it anywhere
+	// else would only print a promise the client cannot keep
+	if ( cgMoba.phase != CG_MOBA_PHASE_DRAFT && cgMoba.phase != CG_MOBA_PHASE_DRAFT_ASSIGN )
+	{
+		return;
+	}
+
+	// nothing to do, and no log line either: the command may be bound to a key in
+	// some setups and would otherwise fill the client log once a second
+	if ( !cgMobaDraft.dismissed && ( trap->Key_GetCatcher() & KEYCATCH_CGAME ) )
+	{
+		return;
+	}
+
+	cgMobaDraft.dismissed = qfalse;
+	cgMobaDraft.hadCatcher = qfalse;
+	trap->Print( "MOBA: draft window reopened by request\n" );
+}
+
+//=========================================================================
 // The window exists while the server is in one of the two draft phases and the
-// player did not close it.
+// player did not ask for it to be hidden.
 //=========================================================================
 static qboolean CG_Moba_DraftWanted( void )
 {
@@ -196,13 +288,20 @@ static qboolean CG_Moba_DraftWanted( void )
 		cgMoba.phase == CG_MOBA_PHASE_DRAFT_ASSIGN ) ? qtrue : qfalse;
 }
 
+//=========================================================================
 // The JKA client only hands key codes to the cgame while KEYCATCH_CGAME is set
 // (cl_keys.cpp CL_KeyEvent) and only feeds mouse deltas to CG_MouseEvent under
 // the same bit (cl_input.cpp IN_MouseMove). The window therefore has to hold
-// that bit, and it has to let it go again when it closes. ESC is the one key
-// the client eats itself: it clears the bit and calls CG_EventHandling before
-// the cgame ever sees it, so losing the bit while the window wanted it means
-// the player closed the window, not that the server changed its mind.
+// that bit, and it has to let it go again when it closes.
+//
+// ESC is the one key the client eats itself: it clears the bit and calls
+// CG_EventHandling before the cgame ever sees it (cl_keys.cpp, "escape always
+// gets out of CGAME stuff"). The draft may not be left half way through, so a
+// bit that disappears while the window still wants it is taken back on the next
+// frame instead of being read as a close request. The console key and
+// Shift+ESC are handled before that rule in the client, so a player can always
+// open the console, and the mouse look stays under the client as it was.
+//=========================================================================
 static void CG_Moba_DraftCatcher( void )
 {
 	int catcher = trap->Key_GetCatcher();
@@ -210,12 +309,6 @@ static void CG_Moba_DraftCatcher( void )
 
 	if ( want && !( catcher & KEYCATCH_CGAME ) )
 	{
-		if ( cgMobaDraft.hadCatcher )
-		{
-			cgMobaDraft.dismissed = qtrue;
-			return;
-		}
-
 		trap->Key_SetCatcher( catcher | KEYCATCH_CGAME );
 		cgMobaDraft.hadCatcher = qtrue;
 	}
@@ -322,9 +415,60 @@ static void CG_Moba_RoleColor( const char *role, vec4_t out )
 }
 
 //=========================================================================
-// Turns a click into the chat command the player would have typed. The server
-// owns every rule, this only avoids the pointless round trip for a hero that is
-// plainly gone already.
+// Is the mouse on the confirm button?
+//=========================================================================
+static qboolean CG_Moba_ButtonAt( float mx, float my )
+{
+	return ( mx >= CG_MOBA_BTN_X && mx <= CG_MOBA_BTN_X + CG_MOBA_BTN_W &&
+		my >= CG_MOBA_BTN_Y && my <= CG_MOBA_BTN_Y + CG_MOBA_BTN_H ) ? qtrue : qfalse;
+}
+
+//=========================================================================
+// The mouse pointer. The engine has no in game cursor at all, cgs.activeCursor
+// is set in CG_MouseEvent and then never drawn, and the system cursor is hidden
+// while the game has the mouse, so a window that wants a pointer has to paint
+// one itself. Built from plain rectangles: no shader to load, and it stays
+// crisp because every edge lands on a whole pixel.
+//=========================================================================
+static void CG_Moba_DrawCursor( void )
+{
+	static const vec4_t colorDark	= { 0.00f, 0.00f, 0.00f, 0.90f };
+	static const vec4_t colorLight	= { 1.00f, 1.00f, 1.00f, 1.00f };
+	float x = (float)cgs.cursorX;
+	float y = (float)cgs.cursorY;
+	int i;
+
+	if ( !cg_moba.integer || !CG_Moba_DraftWanted() )
+	{
+		return;
+	}
+
+	if ( x < 0.0f || y < 0.0f || x > 640.0f || y > 480.0f )
+	{
+		return;
+	}
+
+	// a dark halo first, so the pointer stays readable over a light tile
+	for ( i = 0; i < 13; i++ )
+	{
+		CG_FillRect( x - 1.0f, y + i - 1.0f, 15.0f - i, 2.0f, colorDark );
+	}
+
+	// the arrow: a vertical left edge and a diagonal that runs down to the left
+	for ( i = 0; i < 12; i++ )
+	{
+		CG_FillRect( x, y + i, 12.0f - i, 1.0f, colorLight );
+	}
+
+	// the little tail below the tip
+	CG_FillRect( x - 1.0f, y + 12.0f, 4.0f, 8.0f, colorDark );
+	CG_FillRect( x, y + 12.0f, 2.0f, 8.0f, colorLight );
+}
+
+//=========================================================================
+// Turns the confirm button into the chat command the player would have typed.
+// The server owns every rule, this only avoids the pointless round trip for a
+// hero that is plainly gone already.
 //=========================================================================
 static void CG_Moba_DraftAct( int heroId )
 {
@@ -349,6 +493,13 @@ static void CG_Moba_DraftAct( int heroId )
 		return;
 	}
 
+	if ( cgMobaDraft.takenMask & ( 1 << heroId ) )
+	{
+		Q_strncpyz( cgMobaDraft.notice, "that hero is already taken", sizeof( cgMobaDraft.notice ) );
+		cgMobaDraft.noticeUntil = cg.time + 2500;
+		return;
+	}
+
 	if ( cgMoba.phase == CG_MOBA_PHASE_DRAFT &&
 		( cgMobaDraft.redMask & ( 1 << heroId ) || cgMobaDraft.blueMask & ( 1 << heroId ) ) )
 	{
@@ -369,12 +520,21 @@ static void CG_Moba_DraftAct( int heroId )
 	// forward it to the server after the cgame and the ui had their turn
 	trap->SendConsoleCommand( va( "cmd say !%s %i\n",
 		( cgMobaDraft.action == CG_MOBA_ACT_BAN ) ? "ban" : "pick", heroId + 1 ) );
+
+	// one decision per step, the hero is gone from the button as soon as the
+	// command is on its way
+	cgMobaDraft.selected = -1;
+	cgMobaDraft.cursor = -1;
 }
 
 //=========================================================================
 // Input. Runs before the cgame decides what a key is for, because a living
 // local player would otherwise swallow every key and every mouse button.
 // Returns qtrue when the window used the key, so the game never acts on it.
+//
+// A left click only arms the confirm button. A draft step may not be undone and
+// the server has no take back, so the click that decides has to be a second,
+// separate click on the button.
 //=========================================================================
 qboolean CG_Moba_KeyEvent( int key, qboolean down )
 {
@@ -385,15 +545,32 @@ qboolean CG_Moba_KeyEvent( int key, qboolean down )
 		return qfalse;
 	}
 
-	// the mouse wins over the keyboard cursor while it is on the board, so a
-	// click always hits the tile the player is looking at
 	hero = CG_Moba_TileAt( (float)cgs.cursorX, (float)cgs.cursorY );
 
 	switch ( key )
 	{
 	case A_MOUSE1:
+		if ( CG_Moba_ButtonAt( (float)cgs.cursorX, (float)cgs.cursorY ) )
+		{
+			CG_Moba_DraftAct( cgMobaDraft.selected );
+		}
+		else if ( hero >= 0 )
+		{
+			if ( !CG_Moba_Selectable( hero ) )
+			{
+				cgMobaDraft.selected = -1;
+				CG_Moba_DraftAct( hero );	// only to raise the notice
+			}
+			else
+			{
+				cgMobaDraft.selected = hero;
+				cgMobaDraft.cursor = hero;
+			}
+		}
+		return qtrue;
+
 	case A_ENTER:
-		CG_Moba_DraftAct( ( hero >= 0 ) ? hero : cgMobaDraft.cursor );
+		CG_Moba_DraftAct( ( cgMobaDraft.selected >= 0 ) ? cgMobaDraft.selected : cgMobaDraft.cursor );
 		return qtrue;
 
 	case A_CURSOR_LEFT:
@@ -405,6 +582,7 @@ qboolean CG_Moba_KeyEvent( int key, qboolean down )
 		{
 			cgMobaDraft.cursor--;
 		}
+		cgMobaDraft.selected = cgMobaDraft.cursor;
 		return qtrue;
 
 	case A_CURSOR_RIGHT:
@@ -416,6 +594,7 @@ qboolean CG_Moba_KeyEvent( int key, qboolean down )
 		{
 			cgMobaDraft.cursor++;
 		}
+		cgMobaDraft.selected = cgMobaDraft.cursor;
 		return qtrue;
 
 	case A_CURSOR_UP:
@@ -427,6 +606,7 @@ qboolean CG_Moba_KeyEvent( int key, qboolean down )
 		{
 			cgMobaDraft.cursor -= CG_MOBA_COLS;
 		}
+		cgMobaDraft.selected = cgMobaDraft.cursor;
 		return qtrue;
 
 	case A_CURSOR_DOWN:
@@ -438,17 +618,32 @@ qboolean CG_Moba_KeyEvent( int key, qboolean down )
 		{
 			cgMobaDraft.cursor += CG_MOBA_COLS;
 		}
+		cgMobaDraft.selected = cgMobaDraft.cursor;
 		return qtrue;
 
 	case A_0:
-		CG_Moba_DraftAct( 9 );
+		cgMobaDraft.selected = ( CG_Moba_Selectable( 9 ) ) ? 9 : -1;
+		if ( cgMobaDraft.selected < 0 )
+		{
+			CG_Moba_DraftAct( 9 );
+		}
 		return qtrue;
 
 	case A_1: case A_2: case A_3: case A_4: case A_5:
 	case A_6: case A_7: case A_8: case A_9:
 		// the number on the tile is the number of !pick, so the keys and the
 		// board can never mean different heroes
-		CG_Moba_DraftAct( key - A_1 );
+		hero = key - A_1;
+		if ( !CG_Moba_Selectable( hero ) )
+		{
+			cgMobaDraft.selected = -1;
+			CG_Moba_DraftAct( hero );		// only to raise the notice
+		}
+		else
+		{
+			cgMobaDraft.selected = hero;
+			cgMobaDraft.cursor = hero;
+		}
 		return qtrue;
 	}
 
@@ -510,10 +705,15 @@ void CG_Moba_DrawDraft( void )
 	static vec4_t colorBannedText	= { 0.55f, 0.45f, 0.45f, 0.45f };
 	static vec4_t colorTileBg		= { 0.10f, 0.10f, 0.14f, 0.85f };
 	static vec4_t colorHover		= { 1.00f, 1.00f, 1.00f, 0.95f };
+	static vec4_t colorSelected	= { 0.20f, 1.00f, 0.35f, 1.00f };
+	static vec4_t colorBtnOn		= { 0.15f, 0.45f, 0.20f, 0.95f };
+	static vec4_t colorBtnOff		= { 0.16f, 0.16f, 0.18f, 0.95f };
+	static vec4_t colorCursorDark	= { 0.00f, 0.00f, 0.00f, 0.85f };
+	static vec4_t colorCursorLight	= { 1.00f, 1.00f, 1.00f, 1.00f };
 
 	vec4_t roleColor, bg, border;
 	float x, y, textY;
-	int i, col, row, secondsLeft, hover, active;
+	int i, col, row, secondsLeft, hover, active, btnReady;
 	const char *state;
 
 	// the catcher has to be serviced every frame, also while the window is
@@ -568,7 +768,8 @@ void CG_Moba_DrawDraft( void )
 
 	// ---- the board ----
 	hover = CG_Moba_TileAt( (float)cgs.cursorX, (float)cgs.cursorY );
-	active = ( hover >= 0 ) ? hover : cgMobaDraft.cursor;
+	active = ( hover >= 0 ) ? hover :
+		( cgMobaDraft.selected >= 0 ? cgMobaDraft.selected : cgMobaDraft.cursor );
 
 	for ( i = 0; i < MOBA_MAX_HEROES; i++ )
 	{
@@ -620,6 +821,14 @@ void CG_Moba_DrawDraft( void )
 				2.0f, colorHover );
 		}
 
+		// the hero the confirm button would act on is the one that matters, and
+		// a thick green frame reads as "armed" even in the corner of the eye
+		if ( cgMobaDraft.selected == i && CG_Moba_Selectable( i ) )
+		{
+			CG_DrawRect( x + 1.0f, y + 1.0f, CG_MOBA_TILE_W - 2.0f, CG_MOBA_TILE_H - 2.0f,
+				3.0f, colorSelected );
+		}
+
 		CG_Text_Paint( x + 4.0f, y + 2.0f, 0.55f, banned ? colorBannedText : colorDim,
 			va( "%i", i + 1 ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 
@@ -650,21 +859,65 @@ void CG_Moba_DrawDraft( void )
 		}
 	}
 
-	// ---- bottom line: what a click would do, or why nothing happened ----
-	// the notice has to sit below both panels, otherwise the early return of the
-	// "no hero under the mouse" case would swallow the feedback for a bad click
-	if ( cg.time < cgMobaDraft.noticeUntil && cgMobaDraft.notice[0] )
+	// ---- the confirm button ----
+	// A left click on a tile only arms it, this is the click that decides. The
+	// server has no take back, so the step may not be lost to a stray click.
+	btnReady = CG_Moba_Selectable( cgMobaDraft.selected ) ? 1 : 0;
+
+	CG_FillRect( CG_MOBA_BTN_X, CG_MOBA_BTN_Y, CG_MOBA_BTN_W, CG_MOBA_BTN_H,
+		btnReady ? colorBtnOn : colorBtnOff );
+	CG_DrawRect( CG_MOBA_BTN_X, CG_MOBA_BTN_Y, CG_MOBA_BTN_W, CG_MOBA_BTN_H, 1.0f, colorBorder );
+	CG_DrawRect( CG_MOBA_BTN_X, CG_MOBA_BTN_Y, CG_MOBA_BTN_W, CG_MOBA_BTN_H, 1.0f,
+		btnReady ? colorSelected : colorDim );
+
+	if ( CG_Moba_ButtonAt( (float)cgs.cursorX, (float)cgs.cursorY ) && btnReady )
 	{
-		CG_Text_Paint( CG_MOBA_WIN_X + 8.0f, CG_MOBA_WIN_Y + CG_MOBA_WIN_H - 15.0f, 0.62f,
-			colorGold, cgMobaDraft.notice, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+		CG_DrawRect( CG_MOBA_BTN_X + 1.0f, CG_MOBA_BTN_Y + 1.0f,
+			CG_MOBA_BTN_W - 2.0f, CG_MOBA_BTN_H - 2.0f, 2.0f, colorSelected );
+	}
+
+	if ( cgMobaDraft.selected >= 0 )
+	{
+		CG_Text_Paint( CG_MOBA_BTN_X + CG_MOBA_BTN_W * 0.5f -
+			CG_Text_Width( "CONFIRM", 0.66f, FONT_SMALL ) * 0.5f,
+			CG_MOBA_BTN_Y + 4.0f, 0.66f, btnReady ? colorText : colorDim,
+			"CONFIRM", 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 	}
 	else
 	{
-		CG_Text_Paint( CG_MOBA_WIN_X + 8.0f, CG_MOBA_WIN_Y + CG_MOBA_WIN_H - 15.0f, 0.6f,
-			colorHint,
+		CG_Text_Paint( CG_MOBA_BTN_X + CG_MOBA_BTN_W * 0.5f -
+			CG_Text_Width( "pick a hero first", 0.62f, FONT_SMALL ) * 0.5f,
+			CG_MOBA_BTN_Y + 5.0f, 0.62f, colorDim,
+			"pick a hero first", 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	}
+
+	// what the button would do, and why a click on a tile did nothing
+	x = CG_MOBA_BTN_X + CG_MOBA_BTN_W + 10.0f;
+	if ( cg.time < cgMobaDraft.noticeUntil && cgMobaDraft.notice[0] )
+	{
+		CG_Text_Paint( x, CG_MOBA_BTN_Y + 4.0f, 0.64f, colorGold,
+			cgMobaDraft.notice, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	}
+	else if ( cgMobaDraft.selected >= 0 && btnReady )
+	{
+		CG_Text_Paint( x, CG_MOBA_BTN_Y + 4.0f, 0.64f, colorText,
+			va( "%s %s", ( cgMobaDraft.action == CG_MOBA_ACT_BAN ) ? "ban" : "take",
+				mobaHeroTable[cgMobaDraft.selected].name ),
+			0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	}
+	else if ( !cgMobaDraft.canAct )
+	{
+		CG_Text_Paint( x, CG_MOBA_BTN_Y + 4.0f, 0.6f, colorHint,
 			( cgMoba.phase == CG_MOBA_PHASE_DRAFT ) ?
-				"left click: ban  -  ESC: close window" :
-				"left click: take the hero  -  ESC: close window",
+				"the captains are picking, wait for your turn" : "you already have a hero",
+			0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	}
+	else
+	{
+		CG_Text_Paint( x, CG_MOBA_BTN_Y + 4.0f, 0.6f, colorHint,
+			( cgMoba.phase == CG_MOBA_PHASE_DRAFT ) ?
+				"click a hero, then confirm  -  ESC does not close the window" :
+				"click a hero of your team, then confirm  -  !draft brings the window back",
 			0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 	}
 
@@ -933,6 +1186,9 @@ void CG_Moba_Draw( void )
 	// the catcher is serviced here as well, a window that is not on screen has
 	// to give the mouse back
 	CG_Moba_DrawDraft();
+
+	// the cursor goes last, on top of every panel the window drew
+	CG_Moba_DrawCursor();
 
 	CG_Moba_Input();
 
