@@ -1616,6 +1616,8 @@ static serverCommand_t	commands[] = {
 	{ "map_restart",		CG_MapRestart },
 	{ "mobaDraft",			CG_Moba_DraftCommand_f },
 	{ "mobaDraftOpen",		CG_Moba_DraftOpen_f },
+	{ "mobaDraftOwner",		CG_Moba_DraftOwnerCommand_f },
+	{ "mobaInvis",			CG_Moba_InvisCommand_f },
 	{ "mobaShop",			CG_Moba_ServerCommand_f },
 	{ "mobaAbilities",		CG_Moba_AbilitiesCommand_f },
 	{ "nfr",				CG_NewForceRank_f },

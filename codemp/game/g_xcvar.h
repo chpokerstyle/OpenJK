@@ -192,10 +192,19 @@ XCVAR_DEF( moba_bots,					"0",				NULL,						CVAR_LATCH,										qtrue )
 // GT_MOBA_CAPTAIN / GT_MOBA_ALLPICK, so the cvar is the mode a plain team game
 // runs in and the fallback if the two are out of sync.
 XCVAR_DEF( moba_mode,					"1",			NULL,						CVAR_LATCH,										qtrue )
+// debug: parked rebrand of the hero model through the userinfo/ClientUserinfoChanged
+XCVAR_DEF( moba_rebrandModel,			"1",			NULL,						CVAR_LATCH,										qtrue )
 // seconds per draft step: one ban or pick, and the window the whole team has to
 // take a hero out of its pool afterwards
 XCVAR_DEF( moba_pickTime,				"30",			NULL,						CVAR_LATCH,										qtrue )
-XCVAR_DEF( moba_buyTime,				"12",			NULL,						CVAR_LATCH,										qtrue )
+// seconds the lobby waits with at least two clients on the server before the
+// match is (re)started and the draft launches. Everyone typing !ready ends the
+// wait early; moba_lobbyTime is the fallback that fires no matter what.
+XCVAR_DEF( moba_lobbyTime,				"60",			NULL,						CVAR_LATCH,										qtrue )
+XCVAR_DEF( moba_buyTime,				"14",			NULL,						CVAR_LATCH,										qtrue )
+// seconds the fight round lasts after the buy freeze; the clock is shown at the
+// top and the round ends (on the kill lead) when it runs out
+XCVAR_DEF( moba_roundTime,				"180",			NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( moba_roundEndTime,			"6",			NULL,						CVAR_LATCH,										qtrue )
 XCVAR_DEF( pmove_fixed,					"0",			NULL,						CVAR_SYSTEMINFO|CVAR_ARCHIVE,					qtrue )
 XCVAR_DEF( pmove_float,					"0",			NULL,						CVAR_SYSTEMINFO|CVAR_ARCHIVE,					qtrue )

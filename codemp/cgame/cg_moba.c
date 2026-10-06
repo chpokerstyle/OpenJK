@@ -9,6 +9,8 @@ stays in sync with the authoritative game state without any guessing.
 */
 
 #include "cg_local.h"
+#include "ui/ui_shared.h"	// for Menu_FindItemByName (and menuDef_t) first: the header
+							// declares CG_Moba_DrawMana( struct menuDef_s * ) below
 #include "cg_moba.h"
 #include "moba_content.h"
 #include "ui/keycodes.h"
@@ -25,21 +27,39 @@ typedef struct {
 	int			price;
 	const char	*desc;
 	int			category;		// index into cgMobaItemCats
-	vec4_t		chip;			// tile colour, groups the items inside a tab
+	int			maxCount;		// how many copies fit in one slot
+	int			cooldownMs;		// how long the slot is locked after a use
+	int			manaCost;
+	int			durationMs;
 } cgMobaItem_t;
 
 static const char *cgMobaItemCats[] = { "DEFENCE", "ATTACK", "CONSUMABLES" };
 #define CG_MOBA_ITEM_CATS	( (int)( sizeof( cgMobaItemCats ) / sizeof( cgMobaItemCats[0] ) ) )
 
 // The order is the order of mobaItems on the server, because the index of a row
-// is the bit the item mask uses, so the two tables may never be sorted apart.
+// is the bit the item mask uses and the id the server pushes for a slot, so the
+// two tables may never be sorted apart. The prices and the numbers below come
+// from moba_content.h, the same header the server prices its items from, so a
+// rebalance cannot reach one side only.
 static const cgMobaItem_t cgMobaItems[] = {
-	{ "Sturdy Armor",	250,	"+50 armor",					0,	{ 0.30f, 0.50f, 0.80f, 0.95f } },
-	{ "Med Kit",		200,	"+100 health",				2,	{ 0.75f, 0.25f, 0.25f, 0.95f } },
-	{ "Rage Rune",		300,	"+20% damage",				1,	{ 0.85f, 0.45f, 0.15f, 0.95f } },
-	{ "Heavy Plate",	500,	"+100 armor, +50 health",		0,	{ 0.25f, 0.45f, 0.70f, 0.95f } },
-	{ "Power Crystal",	650,	"+50 health, +40% damage",	1,	{ 0.60f, 0.30f, 0.75f, 0.95f } },
-	{ "Shadow Cloak",	400,	"+30 armor, +15% damage",		0,	{ 0.25f, 0.60f, 0.40f, 0.95f } }
+	{ "Sturdy Armor",		250,	"+50 armor",						0,	1,	0,
+		0,	0 },
+	{ "Med Kit",			200,	"heal 100 to a nearby ally",		2,	1,	MOBA_ITEM_MEDKIT_CD,
+		0,	MOBA_ITEM_MEDKIT_HEAL },
+	{ "Rage Rune",			300,	"+20% damage",					1,	1,	0,
+		0,	0 },
+	{ "Heavy Plate",		500,	"+100 armor, +50 health",			0,	1,	0,
+		0,	0 },
+	{ "Power Crystal",		650,	"+50 health, +40% damage",		1,	1,	0,
+		0,	0 },
+	{ "Shadow Cloak",		400,	"+30 armor, +15% damage",			0,	1,	0,
+		0,	0 },
+	{ "Grenade",			75,		"throw a grenade, 4 per player",	2,	MOBA_ITEM_GRENADE_MAX,	MOBA_ITEM_GRENADE_CD,
+		0,	0 },
+	{ "Umbrella",			1000,	"+50 armor for 20 s",				0,	1,	MOBA_ITEM_UMBRELLA_DUR + MOBA_ITEM_UMBRELLA_CD,
+		MOBA_ITEM_UMBRELLA_MANA,	MOBA_ITEM_UMBRELLA_DUR },
+	{ "Invisibility Cloak",	600,	"hidden from enemies, a ghost to allies",	0,	1,	MOBA_ITEM_CLOAK_CD,
+		MOBA_ITEM_CLOAK_MANA,	MOBA_ITEM_CLOAK_DUR }
 };
 
 #define CG_MOBA_NUM_ITEMS	( (int)( sizeof( cgMobaItems ) / sizeof( cgMobaItems[0] ) ) )
@@ -66,6 +86,9 @@ typedef struct {
 	int			noticeUntil;		// "only in the buy phase" message
 	int			category;		// tab of the shop window
 	int			cursor;			// grid slot under the keyboard cursor, -1 = none
+	int			slotItem[2];
+	int			slotCount[2];
+	int			slotCd[2];
 	qboolean	open;				// the player opened the shop with B
 	qboolean	hadCatcher;		// the window currently owns the mouse
 	qboolean	received;
@@ -80,15 +103,18 @@ static cgMobaState_t cgMoba;
 // between so the bar does not stutter. heroId is -1 while the player has no
 // hero, and the bar is then not drawn at all.
 //=========================================================================
-#define CG_MOBA_ABILITIES	4
+#define CG_MOBA_ABILITIES	2
 
 typedef struct {
 	int			heroId;
 	int			cooldown[CG_MOBA_ABILITIES];	// ms left at the moment of the push
 	int			level[CG_MOBA_ABILITIES];
+	int			effect[CG_MOBA_ABILITIES];	// ms left of a buff this slot put on the caster
+	int			mana;			// current mana, snapshot of the last push
+	int			maxMana;		// mana pool of the hero
 	int			receivedAt;
 	qboolean	received;
-	int			loggedHero;		// -2 before the first push, so the first one logs
+	qboolean	loggedHero;		// -2 before the first push, so the first one logs
 	qboolean	loggedCooldown;	// a running timer has been seen at least once
 } cgMobaAbility_t;
 
@@ -105,6 +131,21 @@ static int CG_Moba_CooldownLeft( int slot )
 	}
 
 	left = cgMobaAb.cooldown[slot] - ( cg.time - cgMobaAb.receivedAt );
+
+	return ( left > 0 ) ? left : 0;
+}
+
+// what is left of a running effect of that slot, the push only samples it too
+static int CG_Moba_EffectLeft( int slot )
+{
+	int left;
+
+	if ( !cgMobaAb.received || slot < 0 || slot >= CG_MOBA_ABILITIES )
+	{
+		return 0;
+	}
+
+	left = cgMobaAb.effect[slot] - ( cg.time - cgMobaAb.receivedAt );
 
 	return ( left > 0 ) ? left : 0;
 }
@@ -149,10 +190,10 @@ static int CG_Moba_CooldownLeft( int slot )
 #define CG_MOBA_MODE_ALLPICK	1		// no bans, everybody takes a free hero
 
 typedef struct {
-	int			bannedMask;		// one bit per hero, index into mobaHeroTable
-	int			redMask;
-	int			blueMask;
-	int			takenMask;		// heroes a player has already taken
+	unsigned long long bannedMask;	// one bit per hero, index into mobaHeroTable
+	unsigned long long redMask;
+	unsigned long long blueMask;
+	unsigned long long takenMask;	// heroes a player has already taken
 	int			action;			// CG_MOBA_ACT_*, what the current step is
 	int			canAct;			// only the server may answer this
 	int			secondsLeft;
@@ -168,6 +209,8 @@ typedef struct {
 	qboolean	dismissed;		// only the !draft command clears this
 	int			cursor;			// keyboard cursor, -1 = nothing
 	int			selected;		// hero the confirm button would act on
+	int			scroll;			// first visible board row, for boards taller than the window
+	char		owner[MOBA_MAX_HEROES][MAX_NETNAME];	// player name per taken hero, pushed by the server
 	char		notice[64];
 	int			noticeUntil;
 } cgMobaDraft_t;
@@ -182,7 +225,7 @@ static cgMobaDraft_t cgMobaDraft;
 //=========================================================================
 static qboolean CG_Moba_Selectable( int heroId )
 {
-	int pool;
+	unsigned long long pool;
 
 	if ( heroId < 0 || heroId >= MOBA_MAX_HEROES || !cgMobaDraft.canAct ||
 		cgMobaDraft.action == CG_MOBA_ACT_NONE )
@@ -190,12 +233,12 @@ static qboolean CG_Moba_Selectable( int heroId )
 		return qfalse;
 	}
 
-	if ( cgMobaDraft.bannedMask & ( 1 << heroId ) )
+	if ( cgMobaDraft.bannedMask & ( 1ULL << heroId ) )
 	{
 		return qfalse;
 	}
 
-	if ( cgMobaDraft.takenMask & ( 1 << heroId ) )
+	if ( cgMobaDraft.takenMask & ( 1ULL << heroId ) )
 	{
 		return qfalse;
 	}
@@ -211,36 +254,37 @@ static qboolean CG_Moba_Selectable( int heroId )
 
 	if ( cgMoba.phase == CG_MOBA_PHASE_DRAFT )
 	{
-		int gone;
+		unsigned long long gone;
 
 		// the captains take heroes off the board, so a hero is gone as soon as it
 		// sits in one of the two masks. That is a union, not an intersection: a
 		// hero only one captain has taken must not be offered to the other.
 		gone = cgMobaDraft.redMask | cgMobaDraft.blueMask;
 
-		return ( gone & ( 1 << heroId ) ) ? qfalse : qtrue;
+		return ( gone & ( 1ULL << heroId ) ) ? qfalse : qtrue;
 	}
 
 	// the assign stage hands out heroes out of the pool of the own team
 	pool = ( cgMobaDraft.myTeam == 1 ) ? cgMobaDraft.redMask :
 		( cgMobaDraft.myTeam == 2 ) ? cgMobaDraft.blueMask : 0;
 
-	return ( pool & ( 1 << heroId ) ) ? qtrue : qfalse;
+	return ( pool & ( 1ULL << heroId ) ) ? qtrue : qfalse;
 }
 
 //=========================================================================
-// Server command handler: "mobaDraft <banned> <red> <blue> <taken> <action>
-// <canAct> <seconds> <myHero> <myTeam> <step> <steps> <mode>". Thirty heroes fit
-// into one int, so the whole board travels in a single command and the window
-// never has to ask the server for a second opinion on what is already banned or
-// picked. <taken> is what the team pool masks cannot say: who already has a
-// hero out of the pool. <mode> says whether the board is a shared one (all pick)
-// or the pools of the two captains.
+// Server command handler: "mobaDraft <bannedLo> <bannedHi> <redLo> <redHi>
+// <blueLo> <blueHi> <takenLo> <takenHi> <action> <canAct> <seconds> <myHero>
+// <myTeam> <step> <steps> <mode>". The four hero sets are 64 bit masks and
+// travel as two halves each, so the board can hold far more than thirty heroes
+// and the window never has to ask the server for a second opinion on what is
+// already banned or picked. <taken> is what the team pool masks cannot say: who
+// already has a hero out of the pool. <mode> says whether the board is a shared
+// one (all pick) or the pools of the two captains.
 //=========================================================================
 void CG_Moba_DraftCommand_f( void )
 {
-	char buf[128], *p;
-	int v[12], i;
+	char buf[192], *p;
+	int v[16], i;
 
 	if ( cg_moba.integer == 0 || !CG_Argv( 1 ) || !CG_Argv( 1 )[0] )
 	{
@@ -249,9 +293,9 @@ void CG_Moba_DraftCommand_f( void )
 
 	Q_strncpyz( buf, CG_Argv( 1 ), sizeof( buf ) );
 	p = buf;
-	for ( i = 0; i < 12; i++ )
+	for ( i = 0; i < 16; i++ )
 	{
-		v[i] = strtol( p, &p, 10 );
+		v[i] = (int)strtoul( p, &p, 10 );
 		while ( *p == ' ' )
 		{
 			p++;
@@ -268,6 +312,10 @@ void CG_Moba_DraftCommand_f( void )
 		cgMobaDraft.dismissed = qfalse;
 		cgMobaDraft.cursor = -1;
 		cgMobaDraft.selected = -1;
+		cgMobaDraft.scroll = 0;
+
+		// a new draft must not show the owner names of the last one
+		memset( cgMobaDraft.owner, 0, sizeof( cgMobaDraft.owner ) );
 
 		// A new phase always clears the choice, and the mouse bit decides how the
 		// window is currently held: still set means it kept the mouse across the
@@ -275,19 +323,23 @@ void CG_Moba_DraftCommand_f( void )
 		cgMobaDraft.hadCatcher = ( trap->Key_GetCatcher() & KEYCATCH_CGAME ) ? qtrue : qfalse;
 	}
 
-	cgMobaDraft.bannedMask = v[0];
-	cgMobaDraft.redMask = v[1];
-	cgMobaDraft.blueMask = v[2];
-	cgMobaDraft.takenMask = v[3];
-	cgMobaDraft.action = v[4];
-	cgMobaDraft.canAct = v[5];
-	cgMobaDraft.secondsLeft = v[6];
+	cgMobaDraft.bannedMask = (unsigned long long)(unsigned)v[0] |
+		((unsigned long long)(unsigned)v[1] << 32);
+	cgMobaDraft.redMask = (unsigned long long)(unsigned)v[2] |
+		((unsigned long long)(unsigned)v[3] << 32);
+	cgMobaDraft.blueMask = (unsigned long long)(unsigned)v[4] |
+		((unsigned long long)(unsigned)v[5] << 32);
+	cgMobaDraft.takenMask = (unsigned long long)(unsigned)v[6] |
+		((unsigned long long)(unsigned)v[7] << 32);
+	cgMobaDraft.action = v[8];
+	cgMobaDraft.canAct = v[9];
+	cgMobaDraft.secondsLeft = v[10];
 	cgMobaDraft.receivedAt = cg.time;
-	cgMobaDraft.myHero = v[7];
-	cgMobaDraft.myTeam = v[8];
-	cgMobaDraft.step = v[9];
-	cgMobaDraft.steps = v[10];
-	cgMobaDraft.mode = v[11];
+	cgMobaDraft.myHero = v[11];
+	cgMobaDraft.myTeam = v[12];
+	cgMobaDraft.step = v[13];
+	cgMobaDraft.steps = v[14];
+	cgMobaDraft.mode = v[15];
 	cgMobaDraft.received = qtrue;
 
 	// a hero that the server just took away must not stay armed in the confirm
@@ -302,6 +354,38 @@ void CG_Moba_DraftCommand_f( void )
 		cgMobaDraft.logged = qtrue;
 		trap->Print( va( "MOBA: draft state received: %s\n", buf ) );
 	}
+}
+
+//=========================================================================
+// Server command handler: "mobaDraftOwner <heroId> <player name>". One line per
+// owner and only when a pair changed. The name is everything after the first
+// space so it may contain spaces; it is only used for the tile of a hero that
+// the local player does not own.
+//=========================================================================
+void CG_Moba_DraftOwnerCommand_f( void )
+{
+	const char *arg = CG_Argv( 1 );
+	char *p;
+	int heroId;
+
+	if ( cg_moba.integer == 0 || !arg || !arg[0] )
+	{
+		return;
+	}
+
+	heroId = (int)strtol( arg, &p, 10 );
+
+	if ( heroId < 0 || heroId >= MOBA_MAX_HEROES )
+	{
+		return;
+	}
+
+	while ( *p == ' ' )
+	{
+		p++;
+	}
+
+	Q_strncpyz( cgMobaDraft.owner[heroId], p, sizeof( cgMobaDraft.owner[heroId] ) );
 }
 
 //=========================================================================
@@ -418,10 +502,58 @@ static void CG_Moba_Catcher( void )
 // Which tile is the mouse on. The gaps between the tiles are not tiles, and
 // the window is the only place the cursor can reach a hero.
 //=========================================================================
+static int CG_Moba_MaxScroll( void )
+{
+	int rows = ( MOBA_MAX_HEROES + CG_MOBA_COLS - 1 ) / CG_MOBA_COLS;
+
+	if ( rows <= CG_MOBA_ROWS )
+	{
+		return 0;
+	}
+	return rows - CG_MOBA_ROWS;
+}
+
+static void CG_Moba_ClampScroll( void )
+{
+	int max = CG_Moba_MaxScroll();
+
+	if ( cgMobaDraft.scroll > max )
+	{
+		cgMobaDraft.scroll = max;
+	}
+	if ( cgMobaDraft.scroll < 0 )
+	{
+		cgMobaDraft.scroll = 0;
+	}
+}
+
+// Keeps the keyboard cursor on screen: moving it down past the last visible row
+// has to pull the board with it, otherwise the cursor would leave the window.
+static void CG_Moba_EnsureCursorVisible( void )
+{
+	int row;
+
+	if ( cgMobaDraft.cursor < 0 )
+	{
+		return;
+	}
+
+	row = cgMobaDraft.cursor / CG_MOBA_COLS;
+	if ( row < cgMobaDraft.scroll )
+	{
+		cgMobaDraft.scroll = row;
+	}
+	else if ( row >= cgMobaDraft.scroll + CG_MOBA_ROWS )
+	{
+		cgMobaDraft.scroll = row - CG_MOBA_ROWS + 1;
+	}
+	CG_Moba_ClampScroll();
+}
+
 static int CG_Moba_TileAt( float mx, float my )
 {
 	float fx, fy;
-	int col, row;
+	int col, row, index;
 
 	if ( mx < CG_MOBA_GRID_X || my < CG_MOBA_GRID_Y ||
 		mx > CG_MOBA_GRID_X + CG_MOBA_COLS * ( CG_MOBA_TILE_W + CG_MOBA_TILE_GAP ) ||
@@ -446,20 +578,28 @@ static int CG_Moba_TileAt( float mx, float my )
 		return -1;
 	}
 
-	return row * CG_MOBA_COLS + col;
+	// the board can be taller than the window, so the visible row has to be
+	// shifted by the scroll offset before it becomes a hero index
+	index = ( row + cgMobaDraft.scroll ) * CG_MOBA_COLS + col;
+	if ( index < 0 || index >= MOBA_MAX_HEROES )
+	{
+		return -1;
+	}
+
+	return index;
 }
 
 static const char *CG_Moba_HeroState( int heroId )
 {
-	if ( cgMobaDraft.bannedMask & ( 1 << heroId ) )
+	if ( cgMobaDraft.bannedMask & ( 1ULL << heroId ) )
 	{
 		return "banned";
 	}
-	if ( cgMobaDraft.redMask & ( 1 << heroId ) )
+	if ( cgMobaDraft.redMask & ( 1ULL << heroId ) )
 	{
 		return "red team";
 	}
-	if ( cgMobaDraft.blueMask & ( 1 << heroId ) )
+	if ( cgMobaDraft.blueMask & ( 1ULL << heroId ) )
 	{
 		return "blue team";
 	}
@@ -471,7 +611,7 @@ static const char *CG_Moba_HeroState( int heroId )
 	// is that somebody else already owns it
 	if ( cgMoba.phase == CG_MOBA_PHASE_DRAFT &&
 		cgMobaDraft.mode == CG_MOBA_MODE_ALLPICK &&
-		( cgMobaDraft.takenMask & ( 1 << heroId ) ) )
+		( cgMobaDraft.takenMask & ( 1ULL << heroId ) ) )
 	{
 		return "taken";
 	}
@@ -596,14 +736,14 @@ static void CG_Moba_DraftAct( int heroId )
 		return;
 	}
 
-	if ( cgMobaDraft.bannedMask & ( 1 << heroId ) )
+	if ( cgMobaDraft.bannedMask & ( 1ULL << heroId ) )
 	{
 		Q_strncpyz( cgMobaDraft.notice, "that hero is banned", sizeof( cgMobaDraft.notice ) );
 		cgMobaDraft.noticeUntil = cg.time + 2500;
 		return;
 	}
 
-	if ( cgMobaDraft.takenMask & ( 1 << heroId ) )
+	if ( cgMobaDraft.takenMask & ( 1ULL << heroId ) )
 	{
 		Q_strncpyz( cgMobaDraft.notice, "that hero is already taken", sizeof( cgMobaDraft.notice ) );
 		cgMobaDraft.noticeUntil = cg.time + 2500;
@@ -611,7 +751,7 @@ static void CG_Moba_DraftAct( int heroId )
 	}
 
 	if ( cgMoba.phase == CG_MOBA_PHASE_DRAFT &&
-		( cgMobaDraft.redMask & ( 1 << heroId ) || cgMobaDraft.blueMask & ( 1 << heroId ) ) )
+		( cgMobaDraft.redMask & ( 1ULL << heroId ) || cgMobaDraft.blueMask & ( 1ULL << heroId ) ) )
 	{
 		Q_strncpyz( cgMobaDraft.notice, "that hero is already picked", sizeof( cgMobaDraft.notice ) );
 		cgMobaDraft.noticeUntil = cg.time + 2500;
@@ -642,9 +782,23 @@ static void CG_Moba_DraftAct( int heroId )
 // they work on. The key handler needs them for the click on an icon, so they are
 // announced here.
 //=========================================================================
+// The bar is a corner of the screen, not the middle of it: a quarter of the
+// height of a box would cover the fight the player is trying to watch. The two
+// item slots sit on the same row, left of the abilities.
+#define CG_MOBA_BAR_SIZE		22.0f
+#define CG_MOBA_BAR_GAP		4.0f
+// high enough that a slot and the line above it both stay on screen
+#define CG_MOBA_BAR_Y		( 480.0f - 29.0f )
+
 static qboolean CG_Moba_BarWanted( void );
 static int CG_Moba_BarAt( float mx, float my );
 static void CG_Moba_CastAbility( int slot );
+
+// The two item slots work the same way: the key handler needs to know whether
+// the mouse is on one of them and has to be able to send the use for it.
+static float CG_Moba_SlotX( int slot );
+static qboolean CG_Moba_SlotsWanted( void );
+static void CG_Moba_UseSlot( int slot );
 
 //=========================================================================
 // The shop window is a window like the draft, so it has its own click handling.
@@ -667,6 +821,25 @@ static void CG_Moba_ShopMoveCursor( int dx, int dy );
 // the server has no take back, so the click that decides has to be a second,
 // separate click on the button.
 //=========================================================================
+// which item slot the mouse is over, -1 when it is nowhere near the two boxes
+static int CG_Moba_SlotAt( float mx, float my )
+{
+	int i;
+
+	for ( i = 0; i < 2; i++ )
+	{
+		float x = CG_Moba_SlotX( i );
+
+		if ( mx >= x && mx < x + CG_MOBA_BAR_SIZE &&
+			my >= CG_MOBA_BAR_Y && my < CG_MOBA_BAR_Y + CG_MOBA_BAR_SIZE )
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
 qboolean CG_Moba_KeyEvent( int key, qboolean down )
 {
 	int hero, slot, item, tab;
@@ -686,6 +859,19 @@ qboolean CG_Moba_KeyEvent( int key, qboolean down )
 		if ( slot >= 0 && key == A_MOUSE1 )
 		{
 			CG_Moba_CastAbility( slot );
+			return qtrue;
+		}
+	}
+
+	// The same for the two item slots: a left click is a second way to use the
+	// item, which is worth having in a fight.
+	if ( CG_Moba_SlotsWanted() )
+	{
+		slot = CG_Moba_SlotAt( (float)cgs.cursorX, (float)cgs.cursorY );
+
+		if ( slot >= 0 && key == A_MOUSE1 )
+		{
+			CG_Moba_UseSlot( slot );
 			return qtrue;
 		}
 	}
@@ -777,6 +963,7 @@ qboolean CG_Moba_KeyEvent( int key, qboolean down )
 			cgMobaDraft.cursor--;
 		}
 		cgMobaDraft.selected = cgMobaDraft.cursor;
+		CG_Moba_EnsureCursorVisible();
 		return qtrue;
 
 	case A_CURSOR_RIGHT:
@@ -789,6 +976,7 @@ qboolean CG_Moba_KeyEvent( int key, qboolean down )
 			cgMobaDraft.cursor++;
 		}
 		cgMobaDraft.selected = cgMobaDraft.cursor;
+		CG_Moba_EnsureCursorVisible();
 		return qtrue;
 
 	case A_CURSOR_UP:
@@ -801,6 +989,7 @@ qboolean CG_Moba_KeyEvent( int key, qboolean down )
 			cgMobaDraft.cursor -= CG_MOBA_COLS;
 		}
 		cgMobaDraft.selected = cgMobaDraft.cursor;
+		CG_Moba_EnsureCursorVisible();
 		return qtrue;
 
 	case A_CURSOR_DOWN:
@@ -813,6 +1002,23 @@ qboolean CG_Moba_KeyEvent( int key, qboolean down )
 			cgMobaDraft.cursor += CG_MOBA_COLS;
 		}
 		cgMobaDraft.selected = cgMobaDraft.cursor;
+		CG_Moba_EnsureCursorVisible();
+		return qtrue;
+
+	// the mouse wheel scrolls the board the same way it scrolls a list, and the
+	// scrollbar is drawn from the same offset
+	case A_MWHEELUP:
+		if ( cgMobaDraft.scroll > 0 )
+		{
+			cgMobaDraft.scroll--;
+		}
+		return qtrue;
+
+	case A_MWHEELDOWN:
+		if ( cgMobaDraft.scroll < CG_Moba_MaxScroll() )
+		{
+			cgMobaDraft.scroll++;
+		}
 		return qtrue;
 
 	case A_0:
@@ -837,6 +1043,7 @@ qboolean CG_Moba_KeyEvent( int key, qboolean down )
 		{
 			cgMobaDraft.selected = hero;
 			cgMobaDraft.cursor = hero;
+			CG_Moba_EnsureCursorVisible();
 		}
 		return qtrue;
 	}
@@ -851,6 +1058,12 @@ static const char *CG_Moba_AbilityTag( const mobaAbility_t *ab )
 	case AB_AOE_DAMAGE:	return "area";
 	case AB_AOE_HEAL:		return "heal";
 	case AB_BUFF:			return "buff";
+	case AB_LEAP:			return "leap";
+	case AB_SHIELD:			return "shield";
+	case AB_PROJECTILE:		return "shot";
+	case AB_FLAME:			return "flame";
+	case AB_SILENCE:		return "silence";
+	case AB_MAGICRESIST:	return "mag.res";
 	default:				return "hit";
 	}
 }
@@ -875,6 +1088,39 @@ static const char *CG_Moba_AbilityEffect( const mobaAbility_t *ab )
 			(int)ab->radius );
 	}
 
+	if ( ab->type == AB_LEAP )
+	{
+		return va( "jump %i  slow %i%% for %i s", (int)ab->range,
+			(int)( ab->buffMult * 100.0f ), ab->durationMs / 1000 );
+	}
+
+	if ( ab->type == AB_SHIELD )
+	{
+		return va( "shield %i (+%i)  for %i s", ab->baseEffect, ab->perLevelEffect,
+			ab->durationMs / 1000 );
+	}
+
+	if ( ab->type == AB_PROJECTILE )
+	{
+		return va( "bolt %i (+%i)  4 charges", ab->baseEffect, ab->perLevelEffect );
+	}
+
+	if ( ab->type == AB_FLAME )
+	{
+		return va( "burn %i/s  range %i", ab->baseEffect, (int)ab->range );
+	}
+
+	if ( ab->type == AB_SILENCE )
+	{
+		return va( "silence %i s  radius %i", ab->durationMs / 1000, (int)ab->radius );
+	}
+
+	if ( ab->type == AB_MAGICRESIST )
+	{
+		return va( "resist %i%%  for %i s", (int)( ab->buffMult * 100.0f ),
+			ab->durationMs / 1000 );
+	}
+
 	return va( "damage %i (+%i)  range %i", ab->baseEffect, ab->perLevelEffect,
 		(int)ab->range );
 }
@@ -892,6 +1138,102 @@ static void CG_Moba_AbilityIcon( float x, float y, float s, const mobaAbility_t 
 // the details of the hero under the mouse on the right, the bans and the team
 // picks on the tiles themselves so the board is readable without any chat.
 //=========================================================================
+//=========================================================================
+// Draws a hero name inside a tile. A name wider than the tile wraps at a space
+// into two lines, a name without a usable space is cut down to the tile so it
+// never spills over its neighbours.
+//=========================================================================
+#define CG_MOBA_NAME_SCALE	0.62f
+#define CG_MOBA_NAME_GAP	8.0f
+
+static void CG_Moba_DrawTileName( float x, float y, vec4_t color, const char *name )
+{
+	float maxW = CG_MOBA_TILE_W - 8.0f;
+	float w = (float)CG_Text_Width( name, CG_MOBA_NAME_SCALE, FONT_SMALL );
+	char left[64], right[64];
+	const char *best = NULL;
+	int i, len;
+	float bestMax = 0.0f;
+
+	if ( w <= maxW )
+	{
+		CG_Text_Paint( x + ( CG_MOBA_TILE_W - w ) * 0.5f, y, CG_MOBA_NAME_SCALE, color,
+			name, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+		return;
+	}
+
+	len = (int)strlen( name );
+
+	// look for the space that leaves the two halves closest in width, so the
+	// break lands in the middle of the name instead of after the first word
+	for ( i = 1; i < len - 1; i++ )
+	{
+		float lw, rw, m;
+
+		if ( name[i] != ' ' )
+		{
+			continue;
+		}
+
+		if ( i > (int)sizeof( left ) - 1 )
+		{
+			break;
+		}
+
+		memcpy( left, name, i );
+		left[i] = '\0';
+
+		lw = (float)CG_Text_Width( left, CG_MOBA_NAME_SCALE, FONT_SMALL );
+		rw = (float)CG_Text_Width( name + i + 1, CG_MOBA_NAME_SCALE, FONT_SMALL );
+		m = ( lw > rw ) ? lw : rw;
+
+		if ( !best || m < bestMax )
+		{
+			best = name + i;
+			bestMax = m;
+		}
+	}
+
+	if ( best && bestMax <= maxW )
+	{
+		int n = (int)( best - name );
+
+		memcpy( left, name, n );
+		left[n] = '\0';
+		Q_strncpyz( right, best + 1, sizeof( right ) );
+
+		w = (float)CG_Text_Width( left, CG_MOBA_NAME_SCALE, FONT_SMALL );
+		CG_Text_Paint( x + ( CG_MOBA_TILE_W - w ) * 0.5f, y, CG_MOBA_NAME_SCALE, color,
+			left, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+
+		w = (float)CG_Text_Width( right, CG_MOBA_NAME_SCALE, FONT_SMALL );
+		CG_Text_Paint( x + ( CG_MOBA_TILE_W - w ) * 0.5f, y + CG_MOBA_NAME_GAP,
+			CG_MOBA_NAME_SCALE, color, right, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+		return;
+	}
+
+	// no space that helps: cut the single line down to the tile
+	{
+		int n = len;
+
+		if ( n > (int)sizeof( left ) - 1 )
+		{
+			n = (int)sizeof( left ) - 1;
+		}
+		memcpy( left, name, n );
+		left[n] = '\0';
+
+		while ( n > 1 && CG_Text_Width( left, CG_MOBA_NAME_SCALE, FONT_SMALL ) > maxW )
+		{
+			left[--n] = '\0';
+		}
+
+		w = (float)CG_Text_Width( left, CG_MOBA_NAME_SCALE, FONT_SMALL );
+		CG_Text_Paint( x + ( CG_MOBA_TILE_W - w ) * 0.5f, y, CG_MOBA_NAME_SCALE, color,
+			left, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	}
+}
+
 void CG_Moba_DrawDraft( void )
 {
 	static vec4_t colorWindow		= { 0.02f, 0.02f, 0.05f, 0.90f };
@@ -992,14 +1334,23 @@ void CG_Moba_DrawDraft( void )
 	for ( i = 0; i < MOBA_MAX_HEROES; i++ )
 	{
 		const mobaHero_t *hero = &mobaHeroTable[i];
-		qboolean banned = ( cgMobaDraft.bannedMask & ( 1 << i ) ) ? qtrue : qfalse;
-		qboolean red = ( cgMobaDraft.redMask & ( 1 << i ) ) ? qtrue : qfalse;
-		qboolean blue = ( cgMobaDraft.blueMask & ( 1 << i ) ) ? qtrue : qfalse;
-		float nameW;
+		qboolean banned = ( cgMobaDraft.bannedMask & ( 1ULL << i ) ) ? qtrue : qfalse;
+		qboolean red = ( cgMobaDraft.redMask & ( 1ULL << i ) ) ? qtrue : qfalse;
+		qboolean blue = ( cgMobaDraft.blueMask & ( 1ULL << i ) ) ? qtrue : qfalse;
+		qboolean showOwner;
+		char nameBuf[MAX_NETNAME];
 		int c;
 
 		col = i % CG_MOBA_COLS;
-		row = i / CG_MOBA_COLS;
+		row = i / CG_MOBA_COLS - cgMobaDraft.scroll;
+
+		// the board can hold more heroes than the window has rows, the rows
+		// outside the window are simply not drawn
+		if ( row < 0 || row >= CG_MOBA_ROWS )
+		{
+			continue;
+		}
+
 		x = CG_MOBA_GRID_X + col * ( CG_MOBA_TILE_W + CG_MOBA_TILE_GAP );
 		y = CG_MOBA_GRID_Y + row * ( CG_MOBA_TILE_H + CG_MOBA_TILE_GAP );
 
@@ -1050,15 +1401,44 @@ void CG_Moba_DrawDraft( void )
 		CG_Text_Paint( x + 4.0f, y + 2.0f, 0.55f, banned ? colorBannedText : colorDim,
 			va( "%i", i + 1 ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 
-		nameW = (float)CG_Text_Width( hero->name, 0.62f, FONT_SMALL );
-		CG_Text_Paint( x + ( CG_MOBA_TILE_W - nameW ) * 0.5f, y + 14.0f, 0.62f,
-			banned ? colorBannedText : colorText, hero->name,
-			0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+		CG_Moba_DrawTileName( x, y + 14.0f, banned ? colorBannedText : colorText, hero->name );
 
 		CG_Text_Paint( x + 5.0f, y + 32.0f, 0.55f, banned ? colorBannedText : roleColor,
 			hero->role, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 
 		state = CG_Moba_HeroState( i );
+
+		// A hero somebody else owns is labelled with the owner's name instead of
+		// the generic "you", on every client. The name takes the role line and is
+		// cut down to the tile so it never spills into the neighbour. The owner
+		// himself keeps "you" in the corner.
+		showOwner = ( state && !banned && !red && !blue &&
+			cgMobaDraft.myHero != i && cgMobaDraft.owner[i][0] ) ? qtrue : qfalse;
+
+		if ( showOwner )
+		{
+			int len = (int)strlen( cgMobaDraft.owner[i] );
+
+			if ( len > (int)sizeof( nameBuf ) - 1 )
+			{
+				len = (int)sizeof( nameBuf ) - 1;
+			}
+			memcpy( nameBuf, cgMobaDraft.owner[i], len );
+			nameBuf[len] = '\0';
+
+			while ( len > 1 && CG_Text_Width( nameBuf, 0.55f, FONT_SMALL ) >
+				CG_MOBA_TILE_W - 10.0f )
+			{
+				nameBuf[--len] = '\0';
+			}
+
+			// the role is dropped for a taken hero, the owner's name is the more
+			// useful thing to read on that tile
+			CG_FillRect( x + 4.0f, y + 26.0f, CG_MOBA_TILE_W - 8.0f, 10.0f, bg );
+			CG_Text_Paint( x + 5.0f, y + 32.0f, 0.55f, colorGold, nameBuf,
+				0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+		}
+
 		if ( banned )
 		{
 			CG_Text_Paint( x + CG_MOBA_TILE_W - 26.0f, y + 32.0f, 0.55f, colorBannedText,
@@ -1070,11 +1450,28 @@ void CG_Moba_DrawDraft( void )
 				red ? colorRed : colorBlue, red ? "red" : "blue",
 				0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 		}
-		else if ( state )
+		else if ( state && !showOwner )
 		{
 			CG_Text_Paint( x + CG_MOBA_TILE_W - 26.0f, y + 32.0f, 0.55f, colorGold,
 				"you", 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 		}
+	}
+
+	// ---- scrollbar ----
+	// The board scrolls only while it holds more rows than the window shows, so
+	// the bar appears exactly then and its thumb says how far down the player is.
+	if ( CG_Moba_MaxScroll() > 0 )
+	{
+		float trackX = CG_MOBA_GRID_X + CG_MOBA_COLS * ( CG_MOBA_TILE_W + CG_MOBA_TILE_GAP ) + 1.0f;
+		float trackY = CG_MOBA_GRID_Y;
+		float trackH = CG_MOBA_ROWS * ( CG_MOBA_TILE_H + CG_MOBA_TILE_GAP ) - CG_MOBA_TILE_GAP;
+		int totalRows = ( MOBA_MAX_HEROES + CG_MOBA_COLS - 1 ) / CG_MOBA_COLS;
+		float thumbH = trackH * (float)CG_MOBA_ROWS / (float)totalRows;
+		float thumbY = trackY + ( trackH - thumbH ) * (float)cgMobaDraft.scroll / (float)CG_Moba_MaxScroll();
+
+		CG_FillRect( trackX, trackY, 4.0f, trackH, colorBtnOff );
+		CG_DrawRect( trackX, trackY, 4.0f, trackH, 1.0f, colorBorder );
+		CG_FillRect( trackX, thumbY, 4.0f, thumbH, colorBorder );
 	}
 
 	// ---- the confirm button ----
@@ -1185,6 +1582,10 @@ void CG_Moba_DrawDraft( void )
 			va( "Armor %i", hero->baseArmor ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 		textY += 12.0f;
 
+		CG_Text_Paint( x, textY, 0.58f, colorGreen,
+			va( "Mana %i", hero->maxMana ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+		textY += 12.0f;
+
 		CG_Text_Paint( x, textY, 0.58f, colorDim,
 			va( "Damage %i (+%i/lv)", hero->baseDamage, hero->damagePerLevel ), 0, 0,
 			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
@@ -1194,7 +1595,7 @@ void CG_Moba_DrawDraft( void )
 		if ( state )
 		{
 			CG_Text_Paint( x, textY, 0.58f,
-				( cgMobaDraft.bannedMask & ( 1 << active ) ) ? colorRed : colorDim,
+				( cgMobaDraft.bannedMask & ( 1ULL << active ) ) ? colorRed : colorDim,
 				state, 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 			textY += 12.0f;
 		}
@@ -1222,6 +1623,9 @@ void CG_Moba_DrawDraft( void )
 			CG_Text_Paint( x, textY, 0.55f, colorDim,
 				va( "%s  cd %i s", CG_Moba_AbilityTag( ab ), ab->cooldownMs / 1000 ),
 				0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+
+			CG_Text_Paint( x + 92.0f, textY, 0.55f, colorGreen,
+				va( "mana %i", ab->manaCost ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 			textY += 10.0f;
 
 			CG_Text_Paint( x, textY, 0.55f, colorText, CG_Moba_AbilityEffect( ab ), 0, 0,
@@ -1236,13 +1640,14 @@ void CG_Moba_DrawDraft( void )
 }
 
 //=========================================================================
-// Server command handler: "mobaShop <phase> <seconds> <gold> <mask> <level>".
-// A new phase reopens the shop, so ESC only hides it for the current one.
+// Server command handler: "mobaShop phase seconds gold mask level item0 count0
+// cd0 item1 count1 cd1". A new phase closes the shop, so the window of the last
+// round never stands in the way of the next one.
 //=========================================================================
 void CG_Moba_ServerCommand_f( void )
 {
-	char buf[64], *p;
-	int v[5], i;
+	char buf[128], *p;
+	int v[11], i;
 
 	if ( !CG_Argv( 1 ) || !CG_Argv( 1 )[0] || cg_moba.integer == 0 )
 	{
@@ -1251,7 +1656,7 @@ void CG_Moba_ServerCommand_f( void )
 
 	Q_strncpyz( buf, CG_Argv( 1 ), sizeof( buf ) );
 	p = buf;
-	for ( i = 0; i < 5; i++ )
+	for ( i = 0; i < 11; i++ )
 	{
 		v[i] = strtol( p, &p, 10 );
 		while ( *p == ' ' )
@@ -1268,24 +1673,37 @@ void CG_Moba_ServerCommand_f( void )
 	cgMoba.phase = v[0];
 	cgMoba.secondsLeft = v[1];
 	cgMoba.receivedAt = cg.time;
+	cgMoba.received = qtrue;
 	cgMoba.gold = v[2];
 	cgMoba.itemMask = v[3];
 	cgMoba.level = v[4];
-	cgMoba.received = qtrue;
+	cgMoba.slotItem[0] = v[5];
+	cgMoba.slotCount[0] = v[6];
+	cgMoba.slotCd[0] = v[7];
+	cgMoba.slotItem[1] = v[8];
+	cgMoba.slotCount[1] = v[9];
+	cgMoba.slotCd[1] = v[10];
 
 	if ( !cgMoba.logged )
 	{
 		cgMoba.logged = qtrue;
-		trap->Print( va( "MOBA: shop state received: %s (cg_moba %i)\n",
-			buf, cg_moba.integer ) );
+
+		// A build stamp on purpose: the client prints this once per session, so
+		// "is this the dll I just built" is one glance in the console instead of
+		// counting shop tiles. The counts are the ones this file was built with,
+		// so a stale dll gives itself away here.
+		trap->Print( va( "MOBA: build 05.10 items %i abilities %i item slots %i\n",
+			CG_MOBA_NUM_ITEMS, CG_MOBA_ABILITIES, MOBA_ACTIVE_SLOTS ) );
+		trap->Print( va( "MOBA: shop state: %s (cg_moba %i)\n", buf, cg_moba.integer ) );
 	}
 }
 
 //=========================================================================
 // Ability bar
 //
-// The four abilities are on Q, E, C and V. The letters live in moba.cfg as
-// binds that write a token into cg_mobaAbility, because the JKA client turns
+// The two abilities are on Q and E and the two item slots on C and V. The
+// letters live in moba.cfg as binds that write a token into cg_mobaAbility,
+// because the JKA client turns
 // keys into buttons before the cgame ever sees them (see CG_Moba_HandleToken).
 // moba.cfg is where a player rebinds them, and the bar shows the same letters,
 // so the picture on the screen and the config never disagree.
@@ -1294,14 +1712,7 @@ void CG_Moba_ServerCommand_f( void )
 // kit, and the stock force icons are square jpegs without an alpha channel,
 // which would come out as black boxes on a dark panel.
 //=========================================================================
-static const char *cgMobaAbilityKeys[CG_MOBA_ABILITIES] = { "Q", "E", "C", "V" };
-
-// The bar is a corner of the screen, not the middle of it: a quarter of the
-// height of a box would cover the fight the player is trying to watch.
-#define CG_MOBA_BAR_SIZE		22.0f
-#define CG_MOBA_BAR_GAP		4.0f
-// high enough that a slot and the line above it both stay on screen
-#define CG_MOBA_BAR_Y		( 480.0f - 44.0f )
+static const char *cgMobaAbilityKeys[CG_MOBA_ABILITIES] = { "Q", "E" };
 
 // left edge of a slot, the bar is centred under the crosshair
 static float CG_Moba_BarX( int slot )
@@ -1448,13 +1859,409 @@ static void CG_Moba_AbilityInput( void )
 
 	Q_strncpyz( lastToken, token, sizeof( lastToken ) );
 
-	if ( token[0] >= '1' && token[0] <= '4' && !token[1] )
+	if ( token[0] >= '1' && token[0] <= '2' && !token[1] )
 	{
 		CG_Moba_CastAbility( token[0] - '1' );
 	}
 
 	// clear the token again so the same key can fire the next one
 	trap->SendConsoleCommand( "set cg_mobaAbility 0\n" );
+}
+
+//=========================================================================
+// Item slots
+//
+// The two items a player owns sit in the C and V slots, left of the ability
+// bar, so both fit on one row under the crosshair. The server pushes the item
+// id, the charge count and the remaining cooldown of every slot; the client only
+// draws them and turns a key press into !use1 / !use2, which is the chat command
+// a player could have typed. The server owns whether a use happens at all.
+//
+// The icons are drawn out of plain rectangles. JKA ships no art for a moba kit
+// and the stock force icons are square jpegs without an alpha channel, which
+// would come out as black boxes on a dark panel.
+//=========================================================================
+static const char *cgMobaItemKeys[2] = { "C", "V" };
+
+// what is left of a slot cooldown right now, the push only samples it
+static int CG_Moba_ItemCooldownLeft( int slot )
+{
+	int left;
+
+	if ( !cgMoba.received || slot < 0 || slot > 1 )
+	{
+		return 0;
+	}
+
+	left = cgMoba.slotCd[slot] - ( cg.time - cgMoba.receivedAt );
+
+	return ( left > 0 ) ? left : 0;
+}
+
+// The glyph painter. Every item is drawn from a handful of rectangles inside a
+// square of size s at (x,y), which is what the tile in the shop window and the
+// slot on the bar both call.
+static void CG_Moba_ItemIcon( float x, float y, float s, int item, float alpha )
+{
+	static const vec4_t colorSteel		= { 0.62f, 0.72f, 0.85f, 1.00f };
+	static const vec4_t colorWhite		= { 0.95f, 0.95f, 0.95f, 1.00f };
+	static const vec4_t colorRed		= { 0.90f, 0.28f, 0.22f, 1.00f };
+	static const vec4_t colorOrange	= { 0.95f, 0.55f, 0.15f, 1.00f };
+	static const vec4_t colorPurple	= { 0.70f, 0.40f, 0.90f, 1.00f };
+	static const vec4_t colorGreen		= { 0.35f, 0.80f, 0.50f, 1.00f };
+	static const vec4_t colorBlue		= { 0.35f, 0.70f, 0.95f, 1.00f };
+	static const vec4_t colorDark		= { 0.25f, 0.28f, 0.38f, 1.00f };
+	const vec4_t *c;
+	vec4_t color;
+	int i;
+
+	switch ( item )
+	{
+	case MOBA_ITEM_STURDY_ARMOR:	c = &colorSteel;	break;
+	case MOBA_ITEM_MEDKIT:			c = &colorRed;	break;
+	case MOBA_ITEM_RAGE_RUNE:		c = &colorOrange;	break;
+	case MOBA_ITEM_HEAVY_PLATE:	c = &colorSteel;	break;
+	case MOBA_ITEM_POWER_CRYSTAL:	c = &colorPurple;	break;
+	case MOBA_ITEM_SHADOW_CLOAK:	c = &colorGreen;	break;
+	case MOBA_ITEM_GRENADE:		c = &colorDark;	break;
+	case MOBA_ITEM_UMBRELLA:		c = &colorBlue;	break;
+	case MOBA_ITEM_INVIS_CLOAK:	c = &colorWhite;	break;
+	default:						c = &colorWhite;	break;
+	}
+
+	for ( i = 0; i < 4; i++ )
+	{
+		color[i] = (*c)[i];
+	}
+	color[3] = alpha;
+
+	switch ( item )
+	{
+	case MOBA_ITEM_STURDY_ARMOR:
+	case MOBA_ITEM_HEAVY_PLATE:
+		// a shield: a rounded body with a boss in the middle
+		CG_FillRect( x + 0.18f * s, y + 0.10f * s, 0.64f * s, 0.36f * s, color );
+		CG_FillRect( x + 0.10f * s, y + 0.20f * s, 0.16f * s, 0.20f * s, color );
+		CG_FillRect( x + 0.74f * s, y + 0.20f * s, 0.16f * s, 0.20f * s, color );
+		CG_FillRect( x + 0.26f * s, y + 0.46f * s, 0.48f * s, 0.10f * s, color );
+		CG_FillRect( x + 0.34f * s, y + 0.56f * s, 0.32f * s, 0.10f * s, color );
+		CG_FillRect( x + 0.42f * s, y + 0.66f * s, 0.16f * s, 0.10f * s, color );
+		CG_FillRect( x + 0.42f * s, y + 0.20f * s, 0.16f * s, 0.16f * s, color );
+		break;
+
+	case MOBA_ITEM_MEDKIT:
+		// a white case with a cross, the one image everybody knows
+		CG_FillRect( x + 0.12f * s, y + 0.26f * s, 0.76f * s, 0.56f * s, color );
+		CG_FillRect( x + 0.24f * s, y + 0.14f * s, 0.52f * s, 0.14f * s, color );
+		CG_FillRect( x + 0.42f * s, y + 0.36f * s, 0.16f * s, 0.36f * s, colorWhite );
+		CG_FillRect( x + 0.32f * s, y + 0.46f * s, 0.36f * s, 0.16f * s, colorWhite );
+		break;
+
+	case MOBA_ITEM_RAGE_RUNE:
+		// a rune: a diamond with a bar through it
+		for ( i = 0; i < 4; i++ )
+		{
+			CG_FillRect( x + ( 0.18f + 0.16f * i ) * s, y + ( 0.14f + 0.16f * i ) * s,
+				( 0.68f - 0.32f * i ) * s, ( 0.68f - 0.32f * i ) * s, color );
+		}
+		CG_FillRect( x + 0.06f * s, y + 0.44f * s, 0.88f * s, 0.12f * s, colorWhite );
+		break;
+
+	case MOBA_ITEM_POWER_CRYSTAL:
+		// a crystal: a tall diamond, the mana pool next to a fire rune
+		CG_FillRect( x + 0.34f * s, y + 0.06f * s, 0.32f * s, 0.20f * s, color );
+		CG_FillRect( x + 0.22f * s, y + 0.24f * s, 0.56f * s, 0.22f * s, color );
+		CG_FillRect( x + 0.10f * s, y + 0.44f * s, 0.80f * s, 0.22f * s, color );
+		CG_FillRect( x + 0.22f * s, y + 0.64f * s, 0.56f * s, 0.20f * s, color );
+		CG_FillRect( x + 0.34f * s, y + 0.82f * s, 0.32f * s, 0.12f * s, color );
+		CG_FillRect( x + 0.44f * s, y + 0.30f * s, 0.10f * s, 0.40f * s, colorWhite );
+		break;
+
+	case MOBA_ITEM_SHADOW_CLOAK:
+		// a cloak: a hood over shoulders that narrow to the feet
+		CG_FillRect( x + 0.26f * s, y + 0.08f * s, 0.48f * s, 0.16f * s, color );
+		CG_FillRect( x + 0.34f * s, y + 0.24f * s, 0.32f * s, 0.14f * s, color );
+		CG_FillRect( x + 0.18f * s, y + 0.38f * s, 0.64f * s, 0.20f * s, color );
+		CG_FillRect( x + 0.26f * s, y + 0.58f * s, 0.48f * s, 0.16f * s, color );
+		CG_FillRect( x + 0.34f * s, y + 0.74f * s, 0.32f * s, 0.16f * s, color );
+		break;
+
+	case MOBA_ITEM_GRENADE:
+		// a thermal detonator: a body, a neck and a plunger on top
+		CG_FillRect( x + 0.22f * s, y + 0.26f * s, 0.56f * s, 0.62f * s, color );
+		CG_FillRect( x + 0.38f * s, y + 0.12f * s, 0.24f * s, 0.16f * s, colorSteel );
+		CG_FillRect( x + 0.28f * s, y + 0.02f * s, 0.44f * s, 0.12f * s, colorRed );
+		CG_FillRect( x + 0.32f * s, y + 0.44f * s, 0.36f * s, 0.10f * s, colorOrange );
+		CG_FillRect( x + 0.32f * s, y + 0.62f * s, 0.36f * s, 0.10f * s, colorOrange );
+		break;
+
+	case MOBA_ITEM_UMBRELLA:
+		// an umbrella: a dome over a shaft, the shape everybody knows
+		CG_FillRect( x + 0.16f * s, y + 0.34f * s, 0.68f * s, 0.12f * s, color );
+		CG_FillRect( x + 0.10f * s, y + 0.22f * s, 0.80f * s, 0.14f * s, color );
+		CG_FillRect( x + 0.24f * s, y + 0.10f * s, 0.52f * s, 0.14f * s, color );
+		CG_FillRect( x + 0.44f * s, y + 0.02f * s, 0.12f * s, 0.10f * s, color );
+		CG_FillRect( x + 0.46f * s, y + 0.46f * s, 0.08f * s, 0.46f * s, colorWhite );
+		CG_FillRect( x + 0.38f * s, y + 0.88f * s, 0.24f * s, 0.08f * s, colorWhite );
+		break;
+
+	case MOBA_ITEM_INVIS_CLOAK:
+		// a cloaked silhouette that fades out upwards, plus the empty outline
+		// it starts from and ends in
+		for ( i = 0; i < 5; i++ )
+		{
+			CG_FillRect( x + ( 0.22f + 0.06f * i ) * s, y + ( 0.56f - 0.10f * i ) * s,
+				( 0.56f - 0.12f * i ) * s, ( 0.12f + 0.04f * i ) * s, color );
+		}
+		CG_FillRect( x + 0.34f * s, y + 0.06f * s, 0.32f * s, 0.26f * s, color );
+		CG_FillRect( x + 0.06f * s, y + 0.16f * s, 0.88f * s, 0.04f * s, color );
+		break;
+
+	default:
+		CG_FillRect( x + 0.20f * s, y + 0.20f * s, 0.60f * s, 0.60f * s, color );
+		break;
+	}
+}
+
+// left edge of an item slot, the two slots sit left of the ability bar
+static float CG_Moba_SlotX( int slot )
+{
+	return CG_Moba_BarX( 0 ) - ( 2 - slot ) * ( CG_MOBA_BAR_SIZE + CG_MOBA_BAR_GAP );
+}
+
+static qboolean CG_Moba_SlotsWanted( void )
+{
+	if ( !cg_moba.integer || !cgMoba.received )
+	{
+		return qfalse;
+	}
+
+	if ( cgMoba.phase != CG_MOBA_PHASE_BUY && cgMoba.phase != CG_MOBA_PHASE_FIGHT )
+	{
+		return qfalse;
+	}
+
+	return qtrue;
+}
+
+static void CG_Moba_UseSlot( int slot )
+{
+	if ( slot < 0 || slot > 1 || !CG_Moba_SlotsWanted() )
+	{
+		return;
+	}
+
+	trap->SendConsoleCommand( va( "cmd say !use%i\n", slot + 1 ) );
+}
+
+// The binds in moba.cfg write the slot number into cg_mobaItem, one token per
+// press, and the cgame reads and clears that cvar once a frame. It is a cvar of
+// its own and not cg_mobaAbility, because a letter can be an ability or an item
+// and both tokens have to be able to sit next to each other for one frame.
+static void CG_Moba_ItemInput( void )
+{
+	static char lastToken[16] = "0";
+	char token[16];
+
+	trap->Cvar_VariableStringBuffer( "cg_mobaItem", token, sizeof( token ) );
+
+	if ( Q_stricmp( token, lastToken ) == 0 )
+	{
+		return;
+	}
+
+	Q_strncpyz( lastToken, token, sizeof( lastToken ) );
+
+	if ( token[0] >= '1' && token[0] <= '2' && !token[1] )
+	{
+		CG_Moba_UseSlot( token[0] - '1' );
+	}
+
+	trap->SendConsoleCommand( "set cg_mobaItem 0\n" );
+}
+
+// The two item slots. Empty slots are drawn as a dark box with the key in it,
+// because a player who bought nothing still has to see where the items would
+// go.
+static void CG_Moba_DrawItemSlots( void )
+{
+	static vec4_t colorBg		= { 0.02f, 0.02f, 0.05f, 0.80f };
+	static vec4_t colorBorder	= { 0.60f, 0.50f, 0.20f, 0.95f };
+	static vec4_t colorReady	= { 0.30f, 0.90f, 0.40f, 0.90f };
+	static vec4_t colorWait		= { 0.35f, 0.35f, 0.40f, 0.90f };
+	static vec4_t colorEmpty	= { 0.25f, 0.25f, 0.30f, 0.70f };
+	static vec4_t colorShade	= { 0.00f, 0.00f, 0.00f, 0.65f };
+	static vec4_t colorKey		= { 1.00f, 0.85f, 0.30f, 1.00f };
+	static vec4_t colorText		= { 1.00f, 1.00f, 1.00f, 1.00f };
+	static vec4_t colorDim		= { 0.60f, 0.60f, 0.60f, 1.00f };
+
+	float x, w, frac;
+	int i, id, left, count, total;
+
+	if ( !CG_Moba_SlotsWanted() )
+	{
+		return;
+	}
+
+	// the name of a slot only while the mouse is on it, same rule as the bar
+	for ( i = 0; i < 2; i++ )
+	{
+		x = CG_Moba_SlotX( i );
+		id = cgMoba.slotItem[i];
+		left = CG_Moba_ItemCooldownLeft( i );
+		count = cgMoba.slotCount[i];
+
+		if ( id >= 0 && id < CG_MOBA_NUM_ITEMS )
+		{
+			const char *tip = cgMobaItems[id].name;
+
+			if ( cgMobaItems[id].maxCount > 1 )
+			{
+				tip = va( "%s  x%i", tip, count );
+			}
+
+			if ( left > 0 )
+			{
+				tip = va( "%s  -  %i s", tip, ( left + 999 ) / 1000 );
+			}
+
+			if ( cg_moba.integer && cgs.cursorX >= (int)x &&
+				cgs.cursorX < (int)( x + CG_MOBA_BAR_SIZE ) &&
+				cgs.cursorY >= (int)CG_MOBA_BAR_Y &&
+				cgs.cursorY < (int)( CG_MOBA_BAR_Y + CG_MOBA_BAR_SIZE ) )
+			{
+				w = (float)CG_Text_Width( tip, 0.6f, FONT_SMALL );
+				CG_Text_Paint( ( 640.0f - w ) * 0.5f, CG_MOBA_BAR_Y - 12.0f, 0.6f,
+					( left > 0 ) ? colorDim : colorText, tip, 0, 0,
+					ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+			}
+		}
+
+		CG_FillRect( x, CG_MOBA_BAR_Y, CG_MOBA_BAR_SIZE, CG_MOBA_BAR_SIZE, colorBg );
+
+		if ( id >= 0 && id < CG_MOBA_NUM_ITEMS )
+		{
+			CG_DrawRect( x, CG_MOBA_BAR_Y, CG_MOBA_BAR_SIZE, CG_MOBA_BAR_SIZE, 1.0f,
+				( left > 0 ) ? colorWait : colorReady );
+
+			CG_Moba_ItemIcon( x + 5.0f, CG_MOBA_BAR_Y + 5.0f, 12.0f, id,
+				( left > 0 ) ? 0.35f : 1.0f );
+
+			// a stacking item shows how many charges are left, because a grenade
+			// at x1 looks the same as one that is about to be gone
+			if ( cgMobaItems[id].maxCount > 1 )
+			{
+				CG_Text_Paint( x + CG_MOBA_BAR_SIZE - 7.0f, CG_MOBA_BAR_Y, 0.45f,
+					colorText, va( "%i", count ), 0, 0,
+					ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+			}
+
+			if ( left > 0 )
+			{
+				// the wipe comes down from the top over the whole slot, the same
+				// way the ability bar does it
+				total = cgMobaItems[id].cooldownMs;
+				frac = ( total > 0 ) ? (float)left / (float)total : 0.0f;
+
+				if ( frac > 1.0f )
+				{
+					frac = 1.0f;
+				}
+
+				CG_FillRect( x + 1.0f, CG_MOBA_BAR_Y + 1.0f, CG_MOBA_BAR_SIZE - 2.0f,
+					( CG_MOBA_BAR_SIZE - 2.0f ) * frac, colorShade );
+
+				w = (float)CG_Text_Width( va( "%i", ( left + 999 ) / 1000 ), 0.55f, FONT_SMALL );
+				CG_Text_Paint( x + ( CG_MOBA_BAR_SIZE - w ) * 0.5f, CG_MOBA_BAR_Y + 6.0f,
+					0.55f, colorText, va( "%i", ( left + 999 ) / 1000 ), 0, 0,
+					ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+			}
+		}
+		else
+		{
+			// empty slot: a dashed box, no icon, so it never looks like an item
+			CG_DrawRect( x, CG_MOBA_BAR_Y, CG_MOBA_BAR_SIZE, CG_MOBA_BAR_SIZE, 1.0f,
+				colorEmpty );
+			CG_FillRect( x + 6.0f, CG_MOBA_BAR_Y + 10.0f, 10.0f, 2.0f, colorEmpty );
+		}
+
+		CG_Text_Paint( x + 1.0f, CG_MOBA_BAR_Y, 0.42f, colorKey,
+			cgMobaItemKeys[i], 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+	}
+}
+
+//=========================================================================
+// Flame channel input. The server pays the flame per second, so the client
+// only has to repeat the cast while the key is held; every repeat pushes the
+// channel a little further and the server keeps the channel alive as long as
+// the repeats keep coming. A missing repeat (a stall, a menu) is covered by the
+// server's grace time, a release stops it at once.
+//=========================================================================
+static qboolean cgMobaFlameHeld = qfalse;
+static int cgMobaFlameNext = 0;
+
+// the slot of the hero's flame ability, -1 when the hero has none
+static int CG_Moba_FlameSlot( void )
+{
+	const mobaHero_t *hero;
+	int i;
+
+	if ( !cgMobaAb.received || cgMobaAb.heroId < 0 || cgMobaAb.heroId >= MOBA_MAX_HEROES )
+	{
+		return -1;
+	}
+
+	hero = &mobaHeroTable[cgMobaAb.heroId];
+
+	for ( i = 0; i < CG_MOBA_ABILITIES; i++ )
+	{
+		if ( hero->abilities[i].type == AB_FLAME )
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+static void CG_Moba_FlameInput( void )
+{
+	int slot;
+
+	if ( !cgMobaFlameHeld || !CG_Moba_BarWanted() || cg.time < cgMobaFlameNext )
+	{
+		return;
+	}
+
+	slot = CG_Moba_FlameSlot();
+
+	if ( slot < 0 )
+	{
+		return;
+	}
+
+	cgMobaFlameNext = cg.time + 200;
+	CG_Moba_CastAbility( slot );
+}
+
+void CG_Moba_FlameDown_f( void )
+{
+	int slot = CG_Moba_FlameSlot();
+
+	cgMobaFlameHeld = qtrue;
+	cgMobaFlameNext = 0;
+
+	// the key is the second ability slot: with a flame it channels, without one
+	// it is a plain instant cast, fired once here so the press is never lost
+	if ( slot != 1 && CG_Moba_BarWanted() )
+	{
+		CG_Moba_CastAbility( 1 );
+	}
+}
+
+void CG_Moba_FlameUp_f( void )
+{
+	cgMobaFlameHeld = qfalse;
 }
 
 static void CG_Moba_DrawAbilityBar( void )
@@ -1543,20 +2350,54 @@ static void CG_Moba_DrawAbilityBar( void )
 				ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 		}
 	}
+
+	// a running effect gets its own row of icons five pixels above the bar, one
+	// per slot that has something going, drawn exactly like an ability icon
+	{
+		static vec4_t colorEffectBg	= { 0.02f, 0.05f, 0.10f, 0.70f };
+		static vec4_t colorEffect	= { 0.45f, 0.75f, 1.00f, 0.95f };
+		float ey = CG_MOBA_BAR_Y - CG_MOBA_BAR_SIZE - 5.0f;
+
+		for ( i = 0; i < CG_MOBA_ABILITIES; i++ )
+		{
+			int eff = CG_Moba_EffectLeft( i );
+
+			if ( eff <= 0 )
+			{
+				continue;
+			}
+
+			x = CG_Moba_BarX( i );
+			ab = &hero->abilities[i];
+
+			CG_FillRect( x, ey, CG_MOBA_BAR_SIZE, CG_MOBA_BAR_SIZE, colorEffectBg );
+			CG_DrawRect( x, ey, CG_MOBA_BAR_SIZE, CG_MOBA_BAR_SIZE, 1.0f, colorEffect );
+
+			CG_Moba_AbilityIcon( x + 5.0f, ey + 5.0f, 12.0f, ab, 1.0f );
+
+			// the seconds left of the effect in the corner, same as the cooldown
+			w = (float)CG_Text_Width( va( "%i", ( eff + 999 ) / 1000 ), 0.42f, FONT_SMALL );
+			CG_Text_Paint( x + CG_MOBA_BAR_SIZE - w - 1.0f, ey, 0.42f, colorText,
+				va( "%i", ( eff + 999 ) / 1000 ), 0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
+		}
+	}
 }
 
 //=========================================================================
 // Server command handler for the ability bar:
-// "mobaAbilities heroId cd0 cd1 cd2 cd3 lv0 lv1 lv2 lv3".
+// "mobaAbilities heroId cd0 cd1 cd2 cd3 lv0 lv1 lv2 lv3 mana maxMana
+//  eff0 eff1 eff2 eff3".
 //
 // The hero id comes first so the bar knows whose four abilities it draws, and
 // the cooldowns are milliseconds rather than seconds: a 6 second cooldown that
-// ticks in whole seconds would sit at "1" for a full second and then jump.
+// ticks in whole seconds would sit at "1" for a full second and then jump. The
+// mana pair lets the counter be drawn without server traffic of its own, and the
+// last four numbers are the effect times that drive the buff icons above the bar.
 //=========================================================================
 void CG_Moba_AbilitiesCommand_f( void )
 {
-	char buf[64], *p;
-	int v[9], i;
+	char buf[96], *p;
+	int v[15], i;
 
 	if ( !CG_Argv( 1 ) || !CG_Argv( 1 )[0] || cg_moba.integer == 0 )
 	{
@@ -1565,7 +2406,7 @@ void CG_Moba_AbilitiesCommand_f( void )
 
 	Q_strncpyz( buf, CG_Argv( 1 ), sizeof( buf ) );
 	p = buf;
-	for ( i = 0; i < 9; i++ )
+	for ( i = 0; i < 15; i++ )
 	{
 		v[i] = strtol( p, &p, 10 );
 		while ( *p == ' ' )
@@ -1580,7 +2421,11 @@ void CG_Moba_AbilitiesCommand_f( void )
 	{
 		cgMobaAb.cooldown[i] = v[1 + i];
 		cgMobaAb.level[i] = v[5 + i];
+		cgMobaAb.effect[i] = v[11 + i];
 	}
+
+	cgMobaAb.mana = v[9];
+	cgMobaAb.maxMana = v[10];
 
 	cgMobaAb.receivedAt = cg.time;
 	cgMobaAb.received = qtrue;
@@ -1613,6 +2458,123 @@ void CG_Moba_AbilitiesCommand_f( void )
 	}
 }
 
+//=========================================================================
+// Mana counter. The vanilla force bar (bottom right) keeps working as the
+// fatigue bar, spent on jumps and combo attacks. The mana pool is shown as a
+// number next to the health and armor counters of the lefthud menu, in the
+// same mana green as the old crystals. The server pushes the current value five
+// times a second and the client fills the pool up with the regen rate in
+// between, exactly like a cooldown.
+//
+// The lefthud menu owns the health/armor counters, their rects are read out of
+// that menu and the mana counter is placed to the right of the armor counter.
+// When hud.menu positions differ the mana counter simply follows along.
+//=========================================================================
+void CG_Moba_InvisCommand_f( void )
+{
+	int clientNum, left, mode;
+
+	if ( !CG_Argv( 1 ) || !CG_Argv( 1 )[0] || cg_moba.integer == 0 )
+	{
+		return;
+	}
+
+	clientNum = atoi( CG_Argv( 1 ) );
+	left = atoi( CG_Argv( 2 ) );
+	mode = atoi( CG_Argv( 3 ) );
+
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS )
+	{
+		return;
+	}
+
+	// An old server sends no mode at all. Treating that as "invisible" keeps the
+	// cloak working against a mixed build instead of leaving the body on screen
+	// for everybody.
+	if ( !CG_Argv( 3 )[0] )
+	{
+		mode = MOBA_INVIS_HIDDEN;
+	}
+
+	if ( mode < MOBA_INVIS_NONE || mode > MOBA_INVIS_GHOST )
+	{
+		mode = MOBA_INVIS_NONE;
+	}
+
+	// The server already drops a repeat that says the same thing, so whatever
+	// arrives here is a change: a new cloak, a shorter one, a viewer that
+	// changed sides, or the end of it. cg_players.c counts the time down from
+	// here, so the fade runs on the client and not as a stream of per frame
+	// broadcasts.
+	if ( cg.mobaInvisLeft[clientNum] != left || cg.mobaInvisMode[clientNum] != mode )
+	{
+		cg.mobaInvisLeft[clientNum] = left;
+		cg.mobaInvisTime[clientNum] = cg.time;
+		cg.mobaInvisMode[clientNum] = mode;
+	}
+}
+
+void CG_Moba_DrawMana( menuDef_t *menuHUD )
+{
+	static const vec4_t colorMana	= { 0.25f, 0.55f, 1.00f, 1.00f };
+	float mana;
+	int manaInt;
+	int x, y, w, h;
+	itemDef_t *focusItem;
+
+	if ( cg_moba.integer == 0 || !cgMobaAb.received || cgMobaAb.heroId < 0 ||
+		!menuHUD )
+	{
+		return;
+	}
+
+	if ( cgMoba.phase != CG_MOBA_PHASE_BUY && cgMoba.phase != CG_MOBA_PHASE_FIGHT )
+	{
+		// the counter belongs to the buy and the fight phase, the same ones that
+		// show the ability bar
+		return;
+	}
+
+	if ( cgMobaAb.maxMana <= 0 )
+	{
+		return;
+	}
+
+	// mana regens between pushes: the server sent a snapshot, add the fraction
+	// of the regen rate that elapsed since it was taken
+	mana = (float)( cgMobaAb.mana +
+		( cg.time - cgMobaAb.receivedAt ) * MOBA_MANA_REGEN_PER_SEC / 1000 );
+
+	if ( mana > cgMobaAb.maxMana )
+	{
+		mana = (float)cgMobaAb.maxMana;
+	}
+
+	if ( mana < 0 )
+	{
+		mana = 0;
+	}
+
+	manaInt = (int)mana;
+
+	// anchor to the armor counter so the number lands right next to it
+	focusItem = Menu_FindItemByName( menuHUD, "armoramount" );
+	if ( !focusItem )
+	{
+		return;
+	}
+
+	x = (int)focusItem->window.rect.x + (int)focusItem->window.rect.w * 3 + 7;
+	y = (int)focusItem->window.rect.y;
+	w = (int)focusItem->window.rect.w;
+	h = (int)focusItem->window.rect.h;
+
+	trap->R_SetColor( colorMana );
+
+	CG_DrawNumField( x, y, 3, manaInt, w, h, NUM_FONT_SMALL, qfalse );
+
+	trap->R_SetColor( NULL );
+}
 //=========================================================================
 // The shop is only usable during the buy phase, because the server refuses
 // purchases everywhere else (g_moba.c MOBA_BuyItem). The pm_type is
@@ -1809,16 +2771,45 @@ static int CG_Moba_ShopTileAt( float mx, float my )
 
 //=========================================================================
 // Would the server take this purchase right now? Only the look of a tile
-// depends on it, the click always asks the server, which owns the price.
+// depends on it, the click always asks the server, which owns the price and the
+// slot limit. The two rules that matter: an item the player already carries can
+// only be bought again while it still has charges left, and a third item cannot
+// be bought at all once both slots are taken.
 //=========================================================================
 static qboolean CG_Moba_ShopBuyable( int item )
 {
+	int i;
+
 	if ( item < 0 || item >= CG_MOBA_NUM_ITEMS )
 	{
 		return qfalse;
 	}
 
-	if ( cgMoba.itemMask & ( 1 << item ) )
+	for ( i = 0; i < 2; i++ )
+	{
+		if ( cgMoba.slotItem[i] == item )
+		{
+			// already in a slot: only a stacking item can go on top of it, and
+			// only while the stack is not full
+			if ( cgMobaItems[item].maxCount > cgMoba.slotCount[i] )
+			{
+				break;
+			}
+
+			return qfalse;
+		}
+	}
+
+	// not carried yet, so it needs an empty slot to land in
+	for ( i = 0; i < 2; i++ )
+	{
+		if ( cgMoba.slotItem[i] < 0 )
+		{
+			break;
+		}
+	}
+
+	if ( i >= 2 )
 	{
 		return qfalse;
 	}
@@ -1911,6 +2902,7 @@ static void CG_Moba_DrawShop( void )
 	static vec4_t colorTabOn		= { 0.30f, 0.26f, 0.10f, 0.95f };
 	static vec4_t colorTileBg		= { 0.10f, 0.10f, 0.14f, 0.85f };
 	static vec4_t colorTileHover	= { 0.20f, 0.20f, 0.28f, 0.95f };
+	static vec4_t colorIconBg		= { 0.03f, 0.03f, 0.06f, 0.90f };
 
 	float x, y, textY, w;
 	vec4_t phaseColor;
@@ -1983,10 +2975,9 @@ static void CG_Moba_DrawShop( void )
 	{
 		const cgMobaItem_t *it;
 		const char *price;
-		vec4_t chip;
 		float *tileBorder;
 		qboolean owned, buyable;
-		int c;
+		int held, c;
 
 		item = CG_Moba_ShopItem( slot );
 		if ( item < 0 )
@@ -1995,7 +2986,18 @@ static void CG_Moba_DrawShop( void )
 		}
 
 		it = &cgMobaItems[item];
-		owned = ( cgMoba.itemMask & ( 1 << item ) ) ? qtrue : qfalse;
+
+		// how many copies the player carries right now, 0 when none
+		held = 0;
+		for ( c = 0; c < 2; c++ )
+		{
+			if ( cgMoba.slotItem[c] == item )
+			{
+				held = cgMoba.slotCount[c];
+			}
+		}
+
+		owned = ( held > 0 ) ? qtrue : qfalse;
 		buyable = CG_Moba_ShopBuyable( item );
 
 		x = CG_Moba_ShopTileX( slot );
@@ -2015,25 +3017,19 @@ static void CG_Moba_DrawShop( void )
 			( hover == item ) ? colorTileHover : colorTileBg );
 		CG_DrawRect( x, y, CG_MOBA_SHOP_TILE_W, CG_MOBA_SHOP_TILE_H, 1.0f, tileBorder );
 
-		// the colour of the group: the chip turns grey once the item is owned
-		for ( c = 0; c < 4; c++ )
-		{
-			chip[c] = it->chip[c];
-		}
-
-		if ( owned )
-		{
-			chip[0] *= 0.35f;
-			chip[1] *= 0.35f;
-			chip[2] *= 0.35f;
-		}
-
-		CG_FillRect( x + 6.0f, y + 8.0f, 16.0f, 16.0f, chip );
-		CG_DrawRect( x + 6.0f, y + 8.0f, 16.0f, 16.0f, 1.0f, tileBorder );
+		// the same glyph the slot bar draws, so an item looks the same in the
+		// shop and in the inventory. A dark box behind it keeps the icon from
+		// disappearing into the tile.
+		CG_FillRect( x + 6.0f, y + 8.0f, 20.0f, 20.0f, colorIconBg );
+		CG_Moba_ItemIcon( x + 7.0f, y + 9.0f, 18.0f, item,
+			( buyable || owned ) ? 1.0f : 0.40f );
+		CG_DrawRect( x + 6.0f, y + 8.0f, 20.0f, 20.0f, 1.0f, tileBorder );
 
 		// name and price share the first line, the price right aligned
 		w = (float)CG_Text_Width( it->name, 0.7f, FONT_SMALL );
-		price = owned ? "bought" : va( "%ig", it->price );
+		price = ( owned && it->maxCount > 1 ) ?
+			va( "%i/%ig", held, it->price ) :
+			( owned ? "bought" : va( "%ig", it->price ) );
 		CG_Text_Paint( x + 28.0f, y + 6.0f, 0.7f,
 			owned ? colorPriceOwned : colorText, it->name, 0, 0,
 			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
@@ -2056,14 +3052,19 @@ static void CG_Moba_DrawShop( void )
 		// what a click on this tile would do, so no manual is needed
 		CG_Text_Paint( x + 28.0f, y + 38.0f, 0.6f,
 			owned ? colorDim : ( buyable ? colorPrice : colorPricePoor ),
-			owned ? "in your inventory" :
-				( buyable ? "left click - buy" : "not enough gold" ), 0, 0,
+			( owned && it->maxCount > 1 && held < it->maxCount ) ?
+				"left click - buy another" :
+			( owned ? "in your slots" :
+				( buyable ? "left click - buy" :
+					( cgMoba.slotItem[0] >= 0 && cgMoba.slotItem[1] >= 0 ?
+						"both slots are full" : "not enough gold" ) ) ), 0, 0,
 			ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 	}
 
 	// ---- bottom line ----
 	CG_Text_Paint( CG_MOBA_SHOP_X + 10.0f, CG_MOBA_SHOP_Y + CG_MOBA_SHOP_H - 18.0f, 0.7f,
-		colorHint, "left click - buy    arrows and Enter work too    B or ESC - close",
+		colorHint, "you own two items - they sit in the C and V slots, press the "
+		"slot key to use one",
 		0, 0, ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_SMALL );
 }
 
@@ -2073,24 +3074,113 @@ static void CG_Moba_DrawShop( void )
 // ability bar lives in the buy and the fight phase and the pointer goes on top
 // of every window that has the mouse.
 //=========================================================================
+//=========================================================================
+// Round clock at the top of the screen. The buy freeze counts down first,
+// then the fight clock takes over. Both ride on the shop state (phase and
+// seconds), which the server pushes once a second.
+//=========================================================================
+static void CG_Moba_DrawRoundTimer( void )
+{
+	static vec4_t colorBuy		= { 0.40f, 0.90f, 0.40f, 1.00f };
+	static vec4_t colorFight	= { 1.00f, 0.85f, 0.30f, 1.00f };
+	static vec4_t colorUrgent	= { 1.00f, 0.30f, 0.30f, 1.00f };
+	vec4_t color;
+	const char *label;
+	char buf[32];
+	float w;
+	int secs, mins;
+
+	if ( cgMoba.phase != CG_MOBA_PHASE_BUY && cgMoba.phase != CG_MOBA_PHASE_FIGHT )
+	{
+		return;
+	}
+
+	secs = cgMoba.secondsLeft - ( cg.time - cgMoba.receivedAt ) / 1000;
+	if ( secs < 0 )
+	{
+		secs = 0;
+	}
+
+	mins = secs / 60;
+	secs %= 60;
+
+	if ( cgMoba.phase == CG_MOBA_PHASE_BUY )
+	{
+		label = "BUY";
+		Com_sprintf( buf, sizeof( buf ), "%s  %i:%02i", label, mins, secs );
+	}
+	else
+	{
+		Com_sprintf( buf, sizeof( buf ), "%i:%02i", mins, secs );
+	}
+
+	if ( secs <= 10 )
+	{
+		int i;
+
+		for ( i = 0; i < 4; i++ )
+		{
+			color[i] = colorUrgent[i];
+		}
+	}
+	else
+	{
+		int i;
+
+		for ( i = 0; i < 4; i++ )
+		{
+			color[i] = ( cgMoba.phase == CG_MOBA_PHASE_BUY ) ? colorBuy[i] : colorFight[i];
+		}
+	}
+
+	if ( secs <= 5 )
+	{
+		color[3] = 0.35f + 0.65f * ( 0.5f + 0.5f * sin( cg.time * 0.009f ) );
+	}
+
+	w = (float)CG_Text_Width( buf, 0.9f, FONT_MEDIUM );
+	CG_Text_Paint( 320.0f - w * 0.5f, 10.0f, 0.9f, color, buf, 0, 0,
+		ITEM_TEXTSTYLE_SHADOWEDMORE, FONT_MEDIUM );
+}
+
 void CG_Moba_Draw( void )
 {
 	static vec4_t colorHint	= { 0.65f, 0.65f, 0.65f, 1.0f };
 	static vec4_t colorPhase = { 0.70f, 0.70f, 0.70f, 1.00f };
+	static int noStatePrintedAt = 0;
+
+	// Nothing here can draw a single pixel before the server sent "mobaShop":
+	// no state means no shop, no hero board, no pick and no hint, which is
+	// exactly what a server with the mod switched off looks like from the
+	// client. Say so in the console instead of leaving an empty screen, and
+	// repeat it every few seconds so a late start is picked up as well.
+	if ( cg_moba.integer && !cgMoba.received && cg.time - noStatePrintedAt > 5000 )
+	{
+		noStatePrintedAt = cg.time;
+		trap->Print( va( "MOBA: still no state from the server (cg_moba %i, "
+			"gametype %i) - MOBA is off there, or the wrong game dll\n",
+			cg_moba.integer, cgs.gametype ) );
+	}
 
 	// the catcher is serviced here as well, a window that is not on screen has
 	// to give the mouse back
 	CG_Moba_DrawDraft();
 	CG_Moba_DrawShop();
 
+	// the round clock sits at the very top, above every panel
+	CG_Moba_DrawRoundTimer();
+
 	// the cursor goes last, on top of every panel the window drew
 	CG_Moba_DrawCursor();
 
 	CG_Moba_Input();
 	CG_Moba_AbilityInput();
+	CG_Moba_ItemInput();
+	CG_Moba_FlameInput();
 
 	// the ability bar belongs to the bottom of the screen, the shop window to
 	// the middle of it, so they can be on screen together
+	CG_Moba_DrawItemSlots();
 	CG_Moba_DrawAbilityBar();
 
 	if ( !CG_Moba_ShopOpen() )

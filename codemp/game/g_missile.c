@@ -24,6 +24,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include "g_local.h"
 #include "w_saber.h"
 #include "qcommon/q_shared.h"
+#include "g_moba.h"
 
 #define	MISSILE_PRESTEP_TIME	50
 
@@ -717,6 +718,13 @@ void G_MissileImpact( gentity_t *ent, trace_t *trace ) {
 					}
 					//FIXME: throw some sparks off droids,too
 				}
+			}
+
+			// magic_wands MOBA mod: a fireball is a blaster bolt with an added
+			// slow, and the slow only lands if the bolt actually damaged the body
+			if ( didDmg && ent->classname && Q_stricmp( ent->classname, "moba_fireball" ) == 0 )
+			{
+				MOBA_OnMissileImpact( ent, other );
 			}
 		}
 

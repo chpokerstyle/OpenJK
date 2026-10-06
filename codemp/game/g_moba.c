@@ -21,6 +21,19 @@ static void MOBA_ApplyHeroModel( gentity_t *ent );
 static int MOBA_MissingHeroCount( void );
 static void MOBA_GiveHero( gentity_t *ent, int heroId );
 static qboolean MOBA_HeroTaken( int heroId );
+static qboolean MOBA_IsHostile( gentity_t *caster, gentity_t *targ );
+static qboolean MOBA_IsAlly( gentity_t *caster, gentity_t *targ );
+static void MOBA_BreakInvis( gentity_t *attacker );
+static void MOBA_ClearInvis( int clientNum );
+static void MOBA_TickItems( int clientNum );
+
+// A charged ability fires from a small magazine: every cast spends one charge
+// and only the last one starts the long cooldown that refills the magazine.
+#define MOBA_PROJECTILE_CHARGES		4
+#define MOBA_FLAME_GRACE_MS			300		// the client repeats the channel every ~200ms, this covers a late repeat
+#define MOBA_FLAME_MAX_TICK_MS		500		// a stalled frame must not land one huge damage tick
+#define MOBA_FIREBALL_SLOW_PCT		0.10f	// movement slow of a fireball hit
+#define MOBA_FIREBALL_SLOW_MS		4000
 
 #define MOBA_DEFAULT_MAXHEALTH	500
 #define MOBA_DEFAULT_ARMOR		50
@@ -82,7 +95,45 @@ static int mobaRound = 0;
 static int mobaRedAlive = 0, mobaBlueAlive = 0;
 static int mobaRedPlayers = 0, mobaBluePlayers = 0;
 
+// Temporary debug breadcrumb for the BUY -> FIGHT crash hunt. Prints straight
+// to the console so the lines survive a hard crash, unlike the buffered
+// games.log. Enabled by moba_log like every MOBA diagnostic line.
+static void MOBA_DbgPrint( const char *fmt, ... )
+{
+	va_list argptr;
+	char msg[768];
+
+	if ( !moba_log.integer )
+	{
+		return;
+	}
+
+	va_start( argptr, fmt );
+	Q_vsnprintf( msg, sizeof( msg ), fmt, argptr );
+	va_end( argptr );
+
+	trap->Print( "MOBADBG: %s\n", msg );
+}
+
+// ---- Lobby wait / ready / restart / ff ----
+// The lobby gives everyone (up to sv_maxclients) time to connect before the
+// draft launches. !ready counts every human on a team, bots are always ready
+// (they cannot type). The wait ends when every expected player is ready or the
+// moba_lobbyTime fallback fires, whichever comes first.
+static qboolean mobaReady[MAX_CLIENTS];		// client said !ready this lobby
+static int mobaLobbyStart = 0;				// level.time the lobby wait began (0 = idle)
+static int mobaRestartVoteStart = 0;		// level.time of the first !restart vote
+static qboolean mobaRestartVoted[MAX_CLIENTS];
+static int mobaFFVoteStart = 0;				// level.time of the first !ff vote
+static qboolean mobaFFVoted[MAX_CLIENTS];
+
 mobaPlayer_t mobaPlayers[MAX_CLIENTS];
+
+// [cloaked][viewer], so a repeat is skipped per pair: the two allies of a
+// cloaked player get the same value but the enemies do not, and a spectator is
+// nobody's enemy. Declared up here because the reset of a match has to clear it
+// and that runs long before the cloak code.
+static int mobaInvisSent[MAX_CLIENTS][MAX_CLIENTS];
 
 // ---- Draft state, the draft runs once per match ----
 // The plan is a flat list of (action, seat) pairs that is built from the roster
@@ -119,28 +170,68 @@ int mobaNumHeroes = 0;
 // The category is the group the client shows as a tab, and it has to match
 // cgMobaItemCats in cg_moba.c. The order of this table is the order of the item
 // mask, so the two tables may never be sorted apart.
+//
+// maxCount / cooldownMs / manaCost / effectAmount / durationMs describe a use. A
+// cooldownMs of zero makes the item passive: it sits in a slot and gives its
+// bonuses, but there is nothing to press.
 mobaItem_t mobaItems[] = {
-	{ "Sturdy Armor",	"armor",	"DEFENCE",		250,	50,	0,	0,	"+50 armor" },
-	{ "Med Kit",		"med",		"CONSUMABLES",	200,	0,	100, 0,	"+100 health" },
-	{ "Rage Rune",		"rage",		"ATTACK",	300,	0,	0,	20,	"+20% damage" },
-	{ "Heavy Plate",	"heavy",	"DEFENCE",		500,	100, 50, 0,	"+100 armor, +50 health" },
-	{ "Power Crystal",	"crystal",	"ATTACK",	650,	0,	50,	40,	"+50 health, +40% damage" },
-	{ "Shadow Cloak",	"cloak",	"DEFENCE",		400,	30,	0,	15,	"+30 armor, +15% damage" }
+	{ "Sturdy Armor",		"armor",	"DEFENCE",		250,	50,	0,		0,
+		"+50 armor",			1,	0,	0,	0,		0 },
+	{ "Med Kit",			"med",		"CONSUMABLES",	200,	0,		0,		0,
+		"heal 100 to a nearby ally",	1,	MOBA_ITEM_MEDKIT_CD,	0,	MOBA_ITEM_MEDKIT_HEAL,	0 },
+	{ "Rage Rune",			"rage",	"ATTACK",		300,	0,		0,		20,
+		"+20% damage",			1,	0,	0,	0,		0 },
+	{ "Heavy Plate",		"heavy",	"DEFENCE",		500,	100,	50,	0,
+		"+100 armor, +50 health",	1,	0,	0,	0,		0 },
+	{ "Power Crystal",		"crystal",	"ATTACK",	650,	0,		50,	40,
+		"+50 health, +40% damage",	1,	0,	0,	0,		0 },
+	{ "Shadow Cloak",		"shadowcloak","DEFENCE",	400,	30,	0,		15,
+		"+30 armor, +15% damage",	1,	0,	0,	0,		0 },
+	{ "Grenade",			"grenade",	"CONSUMABLES",	75,		0,		0,		0,
+		"throw a grenade, 4 per player",	MOBA_ITEM_GRENADE_MAX, MOBA_ITEM_GRENADE_CD, 0, 0, 0 },
+	{ "Umbrella",			"umbrella","DEFENCE",		1000,	0,		0,		0,
+		"+50 armor for 20 s",	1,	MOBA_ITEM_UMBRELLA_DUR + MOBA_ITEM_UMBRELLA_CD, MOBA_ITEM_UMBRELLA_MANA,
+		MOBA_ITEM_UMBRELLA_ARMOR, MOBA_ITEM_UMBRELLA_DUR },
+	{ "Invisibility Cloak",	"inviscloak","DEFENCE",	600,	0,		0,		0,
+		"hidden from enemies, a ghost to allies",	1,	MOBA_ITEM_CLOAK_CD,	MOBA_ITEM_CLOAK_MANA,	0,	MOBA_ITEM_CLOAK_DUR }
 };
 int mobaNumItems = ARRAY_LEN( mobaItems );
 
 //=========================================================================
+static void MOBA_ResetPlayerSlots( mobaPlayer_t *p )
+{
+	int i;
+
+	// memset leaves slotItem at 0, which reads as "the player already owns the
+	// first item of the shop", so an empty slot has to be -1 and not 0.
+	for ( i = 0; i < MOBA_ACTIVE_SLOTS; i++ )
+	{
+		p->slotItem[i] = -1;
+		p->slotCount[i] = 0;
+		p->slotCdReady[i] = 0;
+		p->slotLastUse[i] = 0;
+	}
+}
+
 static void MOBA_ResetPlayers( void )
 {
 	int i;
 
 	memset( mobaPlayers, 0, sizeof( mobaPlayers ) );
 
+	// Every client must be told about a cloak again after a restart: the table
+	// holds what each viewer was last told, and a stale entry there would make
+	// the new match believe the new cloak is already known.
+	memset( mobaInvisSent, 0, sizeof( mobaInvisSent ) );
+
 	// memset leaves heroId at 0, which reads as "hero 0 already picked" and makes
 	// the whole draft phase a no-op, so mark every slot as empty explicitly.
 	for ( i = 0; i < MAX_CLIENTS; i++ )
 	{
 		mobaPlayers[i].heroId = -1;
+		mobaPlayers[i].mana = 0;
+		mobaPlayers[i].lastManaTick = 0;
+		MOBA_ResetPlayerSlots( &mobaPlayers[i] );
 	}
 }
 
@@ -865,7 +956,11 @@ static void MOBA_RespawnEveryoneOnTeams( void )
 			ent->client->sess.sessionTeam == TEAM_BLUE )
 		{
 			mobaPlayers[i].dead = qfalse;
+			mobaPlayers[i].flameUntil = 0;
+			mobaPlayers[i].flameSlot = -1;
+			ent->client->tempSpectate = 0;
 			ent->client->respawnTime = 0;
+			ent->client->ps.activeForcePass = 0;
 			ClientRespawn( ent );
 		}
 	}
@@ -916,6 +1011,176 @@ static void MOBA_StartLobby( void )
 	mobaPhase = MOBA_PHASE_LOBBY;
 	mobaPhaseEnd = 0;
 	MOBA_CPAll( "^2Magic Wands^7 - waiting for players on both teams (2+)\n" );
+}
+
+// Number of invited players, i.e. the server's own slot limit. This is what
+// "all players" means for the lobby: with three bots on an 8-slot server the
+// 5 humans have to be ready, bots count as ready automatically.
+static int MOBA_ReadyNeeded( void )
+{
+	return sv_maxclients.integer;
+}
+
+// Every client on a team counts, a bot always counts as ready. Only humans
+// that typed !ready this lobby are ready; a bot cannot type.
+static int MOBA_ReadyCount( void )
+{
+	int i, count = 0;
+
+	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+	{
+		if ( !MOBA_SlotActive( i ) )
+		{
+			continue;
+		}
+		if ( g_entities[i].client->sess.sessionTeam != TEAM_RED &&
+			g_entities[i].client->sess.sessionTeam != TEAM_BLUE )
+		{
+			continue;
+		}
+		if ( ( g_entities[i].r.svFlags & SVF_BOT ) || mobaReady[i] )
+		{
+			count++;
+		}
+	}
+
+	return count;
+}
+
+static qboolean MOBA_AllReady( void )
+{
+	return ( MOBA_ReadyCount() >= MOBA_ReadyNeeded() ) ? qtrue : qfalse;
+}
+
+// The whole match (lineups, heroes, round) is thrown away and the lobby starts
+// the wait for a fresh draft over again.
+static void MOBA_RestartMatch( void )
+{
+	int i;
+
+	MOBA_ResetPlayers();
+	MOBA_ResetHeroPool();
+
+	mobaDraftDone = qfalse;
+	mobaRound = 0;
+	mobaDraftFirst = 0;
+	mobaAutoDraftNext = 0;
+
+	mobaLobbyStart = 0;
+	mobaRestartVoteStart = 0;
+	mobaFFVoteStart = 0;
+	for ( i = 0; i < MAX_CLIENTS; i++ )
+	{
+		mobaReady[i] = qfalse;
+		mobaRestartVoted[i] = qfalse;
+		mobaFFVoted[i] = qfalse;
+	}
+
+	MOBA_StartLobby();
+	MOBA_CPAll( "^3The match was restarted^7 - a fresh draft begins after the lobby wait\n" );
+}
+
+// The current player list ("who is where and what") is written to
+// moba_status.txt twice a second. The server launcher reads this file for its
+// players/stats tab, it is deliberately flat so the C# side can parse it with
+// a couple of string operations: line 1 is "phase:<n> round:<n>", every
+// following line is "pipe"-separated fields, the player name is the last one.
+static void MOBA_WriteStatusFile( void )
+{
+	fileHandle_t f;
+	char buf[8192], clean[64], heroName[64];
+	int len = 0, i;
+
+	if ( trap->FS_Open( "moba_status.txt", &f, FS_WRITE ) < 0 )
+	{
+		return;
+	}
+
+	len += Com_sprintf( buf + len, sizeof( buf ) - len,
+		"phase:%i round:%i\n", mobaPhase, mobaRound );
+
+	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+	{
+		gentity_t *ent;
+		const char *name;
+		int n = 0, heroId;
+
+		if ( !MOBA_SlotActive( i ) )
+		{
+			continue;
+		}
+
+		ent = &g_entities[i];
+		name = ent->client->pers.netname;
+
+		// strip colour codes (^7 and the like) so the launcher gets a clean name
+		while ( *name && n < (int)sizeof( clean ) - 1 )
+		{
+			if ( *name == '^' && name[1] )
+			{
+				name += 2;
+				continue;
+			}
+			clean[n++] = *name++;
+		}
+		clean[n] = '\0';
+
+		heroId = mobaPlayers[i].heroId;
+		if ( heroId >= 0 && heroId < MOBA_MAX_HEROES && mobaHeroes[heroId].name )
+		{
+			Q_strncpyz( heroName, mobaHeroes[heroId].name, sizeof( heroName ) );
+		}
+		else
+		{
+			Q_strncpyz( heroName, "-", sizeof( heroName ) );
+		}
+
+		len += Com_sprintf( buf + len, sizeof( buf ) - len,
+			"%i|%i|%i|%s|%i|%i|%i|%i|%s\n",
+			i,
+			ent->client->sess.sessionTeam,
+			( ent->r.svFlags & SVF_BOT ) ? 1 : 0,
+			heroName,
+			mobaPlayers[i].kills,
+			mobaPlayers[i].deaths,
+			mobaPlayers[i].level,
+			mobaPlayers[i].gold,
+			clean );
+	}
+
+	trap->FS_Write( buf, len, f );
+	trap->FS_Close( f );
+}
+
+// Bots cannot type, so a whole team made of bots would be stuck waiting. A
+// bot on a team votes with its team: as soon as every human of a team said
+// !ff, the team concedes.
+static qboolean MOBA_TeamFFComplete( team_t team )
+{
+	int i, humans = 0, voted = 0;
+
+	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+	{
+		if ( !MOBA_SlotActive( i ) )
+		{
+			continue;
+		}
+		if ( g_entities[i].client->sess.sessionTeam != team )
+		{
+			continue;
+		}
+		if ( g_entities[i].r.svFlags & SVF_BOT )
+		{
+			continue;
+		}
+		humans++;
+		if ( mobaFFVoted[i] )
+		{
+			voted++;
+		}
+	}
+
+	return ( humans > 0 && voted >= humans ) ? qtrue : qfalse;
 }
 
 static void MOBA_StartDraft( void )
@@ -994,6 +1259,16 @@ static void MOBA_StartBuy( void )
 
 	MOBA_EnsureTeams();
 
+	// the kill counter is per round and drives the timeout tie-break
+	{
+		int rk;
+
+		for ( rk = 0; rk < level.maxclients && rk < MAX_CLIENTS; rk++ )
+		{
+			mobaPlayers[rk].roundKills = 0;
+		}
+	}
+
 	// a player who never used !pick still has to shop with a real hero, the
 	// placeholder stats have no abilities and are not what the shop prices
 	// were balanced against
@@ -1029,20 +1304,40 @@ static void MOBA_StartBuy( void )
 
 static void MOBA_StartFight( void )
 {
-	mobaPhase = MOBA_PHASE_FIGHT;
-	mobaPhaseEnd = 0;
+	int i;
 
-	// the buy phase assigned the heroes already, this only covers a fight that
-	// somehow starts without one
+	mobaPhase = MOBA_PHASE_FIGHT;
+	mobaPhaseEnd = level.time + moba_roundTime.integer * 1000;
+	MOBA_DbgPrint( "F1 StartFight entry" );
+
+	// the buy phase already handed out the heroes and put everybody on the team
+	// spawns, where they stayed frozen. The round starts from there, without a
+	// second respawn that would yank the players back to the spawns.
 	MOBA_FillMissingHeroes();
-	MOBA_RespawnEveryoneOnTeams();
+	MOBA_DbgPrint( "F2 heroes filled" );
 	MOBA_CPAll( "^1ROUND %i - FIGHT!^7\n", mobaRound + 1 );
+	MOBA_DbgPrint( "F3 banner sent" );
+
+	// full mana pool for the round, the bar regens from there
+	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+	{
+		if ( mobaPlayers[i].inuse && mobaPlayers[i].heroId >= 0 )
+		{
+			MOBA_DbgPrint( "F4 client %i hero %i mana %i", i,
+				mobaPlayers[i].heroId, mobaHeroes[mobaPlayers[i].heroId].maxMana );
+			mobaPlayers[i].mana = mobaHeroes[mobaPlayers[i].heroId].maxMana;
+			mobaPlayers[i].manaFrac = 0;
+			mobaPlayers[i].lastManaTick = level.time;
+		}
+	}
+	MOBA_DbgPrint( "F9 StartFight done" );
 }
 
 static void MOBA_StartRoundEnd( void )
 {
 	team_t winner = TEAM_NUM_TEAMS;
 	int i;
+	int redKills = 0, blueKills = 0;
 
 	if ( mobaRedAlive > mobaBlueAlive )
 	{
@@ -1051,6 +1346,37 @@ static void MOBA_StartRoundEnd( void )
 	else if ( mobaBlueAlive > mobaRedAlive )
 	{
 		winner = TEAM_BLUE;
+	}
+	else
+	{
+		// equal alive count, which is the normal case when the round clock runs
+		// out: the team that got more kills takes it
+		for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+		{
+			gentity_t *ent = &g_entities[i];
+
+			if ( !MOBA_SlotActive( i ) )
+			{
+				continue;
+			}
+			if ( ent->client->sess.sessionTeam == TEAM_RED )
+			{
+				redKills += mobaPlayers[i].roundKills;
+			}
+			else if ( ent->client->sess.sessionTeam == TEAM_BLUE )
+			{
+				blueKills += mobaPlayers[i].roundKills;
+			}
+		}
+
+		if ( redKills > blueKills )
+		{
+			winner = TEAM_RED;
+		}
+		else if ( blueKills > redKills )
+		{
+			winner = TEAM_BLUE;
+		}
 	}
 
 	for ( i = 0; i < level.maxclients; i++ )
@@ -1107,7 +1433,28 @@ void MOBA_InitGame( void )
 	mobaPhase = MOBA_PHASE_LOBBY;
 	mobaPhaseEnd = 0;
 
+	mobaLobbyStart = 0;
+	mobaRestartVoteStart = 0;
+	mobaFFVoteStart = 0;
+	memset( mobaReady, 0, sizeof( mobaReady ) );
+	memset( mobaRestartVoted, 0, sizeof( mobaRestartVoted ) );
+	memset( mobaFFVoted, 0, sizeof( mobaFFVoted ) );
+
 	mobaEnabled = ( g_moba.integer != 0 ) ? qtrue : qfalse;
+
+	// Picking one of the two MOBA game types in the Create a game menu is itself
+	// the request to play the mod, so it turns the mod on even when g_moba is 0.
+	// g_moba stays the switch for a plain team game (a server that only ever runs
+	// moba.cfg), but a dedicated server started by ServerLauncher.exe reads
+	// openjk.cfg alone and never execs moba.cfg, which used to leave g_moba at
+	// its default of 0: no shop, no draft, no pick, and the client had nothing to
+	// show. Choosing the mode in the menu can no longer be silently ignored.
+	if ( !mobaEnabled &&
+		( level.gametype == GT_MOBA_CAPTAIN || level.gametype == GT_MOBA_ALLPICK ) )
+	{
+		mobaEnabled = qtrue;
+		trap->Cvar_Set( "g_moba", "1" );
+	}
 
 	if ( mobaEnabled )
 	{
@@ -1142,7 +1489,21 @@ void MOBA_InitGame( void )
 
 		MOBA_CPAll( "^2Magic Wands^7: %s mode active (heroes: %i)\n",
 			MOBA_ModeName(), mobaNumHeroes );
+
+		// The log line is the only proof of what the match actually is, and it
+		// goes through G_LogPrintf instead of trap->Print: printing from the game
+		// module is a syscall the mod has no business making while the VM is being
+		// set up, and autoexec.cfg keeps moba_log on so the line is always written.
+		MOBA_LogLine( va( "mode ON: %s, %i heroes, g_moba %i, gametype %i, gold %i",
+			MOBA_ModeName(), mobaNumHeroes, g_moba.integer, level.gametype,
+			moba_startGold.integer ), NULL );
+
 		MOBA_StartLobby();
+	}
+	else
+	{
+		MOBA_LogLine( va( "OFF: g_moba %i, gametype %i - set g_moba 1 or "
+			"pick a MOBA game type", g_moba.integer, level.gametype ), NULL );
 	}
 }
 
@@ -1540,9 +1901,11 @@ static void MOBA_RunTestBots( void )
 // otherwise start with the previous occupant's state and never be told about
 // its gold or its item mask
 static char mobaLastSent[MAX_CLIENTS][64];
-static char mobaLastDraftSent[MAX_CLIENTS][128];
-static char mobaAbilitiesSent[MAX_CLIENTS][64];
+static char mobaLastDraftSent[MAX_CLIENTS][192];
+static char mobaAbilitiesSent[MAX_CLIENTS][96];
 static int mobaAbilitiesNext[MAX_CLIENTS];
+static int  mobaOwnerHeroSent[MAX_CLIENTS];			// hero the pushed owner name belongs to, -1 = none
+static char mobaOwnerNameSent[MAX_CLIENTS][MAX_NETNAME];	// last owner name pushed for that hero
 static qboolean mobaShopStateLogged[MAX_CLIENTS];
 static qboolean mobaDraftStateLogged[MAX_CLIENTS];
 
@@ -1557,7 +1920,7 @@ static qboolean mobaDraftStateLogged[MAX_CLIENTS];
 static void MOBA_PushShopState( int clientNum )
 {
 	gentity_t *ent = &g_entities[clientNum];
-	char buf[64];
+	char buf[96];
 	int secs;
 
 	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ||
@@ -1568,9 +1931,20 @@ static void MOBA_PushShopState( int clientNum )
 	}
 
 	secs = ( mobaPhaseEnd > level.time ) ? ( mobaPhaseEnd - level.time + 999 ) / 1000 : 0;
-	Com_sprintf( buf, sizeof( buf ), "%i %i %i %i %i",
+
+	// phase seconds gold itemMask level, then the two item slots as
+	// item count cdLeft triples. An empty slot travels as item -1.
+	Com_sprintf( buf, sizeof( buf ), "%i %i %i %i %i %i %i %i %i %i %i",
 		mobaPhase, secs, mobaPlayers[clientNum].gold,
-		mobaPlayers[clientNum].itemMask, mobaPlayers[clientNum].level );
+		mobaPlayers[clientNum].itemMask, mobaPlayers[clientNum].level,
+		mobaPlayers[clientNum].slotItem[0],
+		mobaPlayers[clientNum].slotCount[0],
+		( mobaPlayers[clientNum].slotCdReady[0] > level.time ) ?
+			( mobaPlayers[clientNum].slotCdReady[0] - level.time ) : 0,
+		mobaPlayers[clientNum].slotItem[1],
+		mobaPlayers[clientNum].slotCount[1],
+		( mobaPlayers[clientNum].slotCdReady[1] > level.time ) ?
+			( mobaPlayers[clientNum].slotCdReady[1] - level.time ) : 0 );
 
 	if ( Q_stricmp( buf, mobaLastSent[clientNum] ) != 0 )
 	{
@@ -1591,19 +1965,23 @@ static void MOBA_PushShopState( int clientNum )
 //=========================================================================
 // Pushes the draft picture to one client so the hero select window can render
 // the bans, the team picks and the turn of that very client:
-// "mobaDraft banned red blue action canAct seconds myHero step steps".
+// "mobaDraft bannedLo bannedHi redLo redHi blueLo blueHi takenLo takenHi
+//  action canAct seconds myHero myTeam step steps mode".
 //
-// The three hero sets are sent as bit masks: 30 heroes fit into an int, one
-// command carries the whole state and the cgame never has to ask the server
-// twice for the same thing. action is 0 nothing to do, 1 ban, 2 pick and
-// canAct is the only field the client is not allowed to guess, because "whose
-// turn is it" changes whenever a captain times out or disconnects.
+// The four hero sets are 64 bit masks, so each one travels as a low and a high
+// half. Thirty heroes would still fit into an int, but the board grows with the
+// content and a 32 bit mask would silently wrap once a thirty third hero is
+// added; the split needs no format change for the next thirty years. action is
+// 0 nothing to do, 1 ban, 2 pick and canAct is the only field the client is not
+// allowed to guess, because "whose turn is it" changes whenever a captain times
+// out or disconnects.
 //=========================================================================
 static void MOBA_PushDraftState( int clientNum )
 {
 	gentity_t *ent = &g_entities[clientNum];
-	char buf[128];
-	int banned = 0, red = 0, blue = 0, taken = 0, i, action, canAct, secs, myTeam;
+	char buf[192];
+	unsigned long long banned = 0, red = 0, blue = 0, taken = 0;
+	int i, action, canAct, secs, myTeam;
 
 	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ||
 		!ent->inuse || !ent->client ||
@@ -1621,7 +1999,7 @@ static void MOBA_PushDraftState( int clientNum )
 		{
 			mobaLastDraftSent[clientNum][0] = '\0';
 			trap->SendServerCommand( ent->s.number,
-				"mobaDraft \"0 0 0 0 0 0 0 0 -1 0 0 0\"" );
+				"mobaDraft \"0 0 0 0 0 0 0 0 0 0 0 0 -1 0 0 0\"" );
 		}
 		return;
 	}
@@ -1630,15 +2008,15 @@ static void MOBA_PushDraftState( int clientNum )
 	{
 		if ( mobaHeroBanned[i] )
 		{
-			banned |= ( 1 << i );
+			banned |= ( 1ULL << i );
 		}
 		else if ( mobaHeroTeam[i] == TEAM_RED )
 		{
-			red |= ( 1 << i );
+			red |= ( 1ULL << i );
 		}
 		else if ( mobaHeroTeam[i] == TEAM_BLUE )
 		{
-			blue |= ( 1 << i );
+			blue |= ( 1ULL << i );
 		}
 	}
 
@@ -1649,7 +2027,7 @@ static void MOBA_PushDraftState( int clientNum )
 	{
 		if ( mobaPlayers[i].inuse && mobaPlayers[i].heroId >= 0 && mobaPlayers[i].heroId < MOBA_MAX_HEROES )
 		{
-			taken |= ( 1 << mobaPlayers[i].heroId );
+			taken |= ( 1ULL << mobaPlayers[i].heroId );
 		}
 	}
 
@@ -1682,8 +2060,13 @@ static void MOBA_PushDraftState( int clientNum )
 
 	// the mode travels with the board, so the window knows whether the heroes it
 	// shows are a shared pool or the pool of the own team
-	Com_sprintf( buf, sizeof( buf ), "%i %i %i %i %i %i %i %i %i %i %i %i",
-		banned, red, blue, taken, action, canAct, secs,
+	Com_sprintf( buf, sizeof( buf ),
+		"%u %u %u %u %u %u %u %u %i %i %i %i %i %i %i %i",
+		(unsigned)( banned & 0xFFFFFFFFULL ), (unsigned)( banned >> 32 ),
+		(unsigned)( red & 0xFFFFFFFFULL ), (unsigned)( red >> 32 ),
+		(unsigned)( blue & 0xFFFFFFFFULL ), (unsigned)( blue >> 32 ),
+		(unsigned)( taken & 0xFFFFFFFFULL ), (unsigned)( taken >> 32 ),
+		action, canAct, secs,
 		mobaPlayers[clientNum].heroId, myTeam, mobaDraftStep, mobaDraftPlanLen,
 		MOBA_ModeAllPick() ? MOBA_MODE_ALLPICK : MOBA_MODE_CAPTAIN );
 
@@ -1701,14 +2084,147 @@ static void MOBA_PushDraftState( int clientNum )
 }
 
 //=========================================================================
+// The draft board can say "you" for a hero only to the player who owns it. To
+// every other client the same tile has to name the owner instead, and only the
+// server knows the pair of hero and player, so it pushes it. One line per owner
+// and only when a pair changed, which is a handful of lines per match.
+//=========================================================================
+static void MOBA_CleanName( const char *in, char *out, int outSize )
+{
+	int i = 0;
+
+	if ( outSize <= 0 )
+	{
+		return;
+	}
+
+	for ( ; in && *in && i < outSize - 1; in++ )
+	{
+		char c = *in;
+
+		// the name travels inside a quoted console command: a quote, a
+		// semicolon or a backslash would end the command or start a new one
+		if ( c == '"' || c == ';' || c == '\\' || c == '$' || c < 32 )
+		{
+			continue;
+		}
+
+		out[i++] = c;
+	}
+
+	out[i] = '\0';
+}
+
+static void MOBA_PushDraftOwners( void )
+{
+	int i;
+
+	if ( mobaPhase != MOBA_PHASE_DRAFT && mobaPhase != MOBA_PHASE_DRAFT_ASSIGN )
+	{
+		for ( i = 0; i < MAX_CLIENTS; i++ )
+		{
+			mobaOwnerHeroSent[i] = -1;
+			mobaOwnerNameSent[i][0] = '\0';
+		}
+		return;
+	}
+
+	for ( i = 0; i < MAX_CLIENTS; i++ )
+	{
+		gentity_t *ent = &g_entities[i];
+		mobaPlayer_t *p = &mobaPlayers[i];
+		char name[MAX_NETNAME], clean[MAX_NETNAME];
+
+		if ( !p->inuse || p->heroId < 0 || p->heroId >= MOBA_MAX_HEROES ||
+			!ent->inuse || !ent->client ||
+			ent->client->pers.connected != CON_CONNECTED )
+		{
+			mobaOwnerHeroSent[i] = -1;
+			mobaOwnerNameSent[i][0] = '\0';
+			continue;
+		}
+
+		Q_strncpyz( name, ent->client->pers.netname, sizeof( name ) );
+		MOBA_CleanName( name, clean, sizeof( clean ) );
+
+		if ( !clean[0] )
+		{
+			continue;
+		}
+
+		if ( mobaOwnerHeroSent[i] == p->heroId &&
+			Q_stricmp( mobaOwnerNameSent[i], clean ) == 0 )
+		{
+			continue;
+		}
+
+		mobaOwnerHeroSent[i] = p->heroId;
+		Q_strncpyz( mobaOwnerNameSent[i], clean, sizeof( mobaOwnerNameSent[i] ) );
+
+		// every client has to learn who owns the hero, not only the player next
+		// to it, so the line is broadcast
+		trap->SendServerCommand( -1, va( "mobaDraftOwner \"%i %s\"", p->heroId, clean ) );
+	}
+}
+
+//=========================================================================
+// Regen: the mana bar fills up slowly in the fight phase, always, so a player
+// that waits a few seconds gets his pool back. Regeneration stays active while
+// the match runs (a drained pool in the shop would feel pointless to waste on
+// nothing). Ticking every frame and adding a fractional amount is heavy, so the
+// regen is computed from the elapsed time since the last tick instead.
+//=========================================================================
+static void MOBA_TickMana( int clientNum )
+{
+	mobaPlayer_t *p = &mobaPlayers[clientNum];
+	int maxMana, elapsed;
+
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS || !p->inuse ||
+		p->heroId < 0 || p->heroId >= mobaNumHeroes )
+	{
+		return;
+	}
+
+	if ( !p->lastManaTick )
+	{
+		p->lastManaTick = level.time;
+		return;
+	}
+
+	elapsed = level.time - p->lastManaTick;
+	p->lastManaTick = level.time;
+
+	if ( elapsed <= 0 )
+	{
+		return;
+	}
+
+	maxMana = mobaHeroes[p->heroId].maxMana;
+
+	// a 50ms tick would give 50*10/1000 == 0, so the regen rate is accumulated
+	// in manaFrac as milli-mana and only whole points are moved into the pool
+	p->manaFrac += elapsed * MOBA_MANA_REGEN_PER_SEC;
+	p->mana += p->manaFrac / 1000;
+	p->manaFrac %= 1000;
+
+	if ( p->mana > maxMana )
+	{
+		p->mana = maxMana;
+	}
+}
+
+//=========================================================================
 // Pushes the four ability slots of one client to its own cgame:
-// "mobaAbilities heroId cd0 cd1 cd2 cd3 lv0 lv1 lv2 lv3".
+// "mobaAbilities heroId cd0 cd1 cd2 cd3 lv0 lv1 lv2 lv3 mana maxMana
+//  eff0 eff1 eff2 eff3".
 //
 // The hero id is repeated even though the draft push already carries it,
 // because the bar in the fight phase has to know which hero it draws and the
 // hero is not part of the shop state. cd is the milliseconds a slot still has
 // to wait, lv the rank the player bought, so the client can grey the slot out
-// and count down without asking anything.
+// and count down without asking anything. eff is the milliseconds a running
+// effect of that slot still lasts, it drives the little buff icons above the
+// bar.
 //
 // A running cooldown changes the numbers on every frame, so the push is rate
 // limited to five times a second; the client counts the remaining time down on
@@ -1718,8 +2234,14 @@ static void MOBA_PushAbilityState( int clientNum )
 {
 	gentity_t *ent = &g_entities[clientNum];
 	mobaPlayer_t *p = &mobaPlayers[clientNum];
-	char buf[64];
-	int i, cd[MOBA_ABILITIES_PER_HERO], lv[MOBA_ABILITIES_PER_HERO];
+	char buf[96];
+	int i, cd[4], lv[4], eff[4];
+
+	// The wire format stays fifteen numbers wide no matter how many abilities a
+	// hero has, the slots that do not exist any more simply travel as zero.
+	memset( cd, 0, sizeof( cd ) );
+	memset( lv, 0, sizeof( lv ) );
+	memset( eff, 0, sizeof( eff ) );
 
 	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ||
 		!ent->inuse || !ent->client ||
@@ -1734,19 +2256,39 @@ static void MOBA_PushAbilityState( int clientNum )
 		if ( mobaAbilitiesSent[clientNum][0] != '\0' )
 		{
 			mobaAbilitiesSent[clientNum][0] = '\0';
-			trap->SendServerCommand( ent->s.number, "mobaAbilities \"-1 0 0 0 0 0 0 0 0\"" );
+			trap->SendServerCommand( ent->s.number,
+				"mobaAbilities \"-1 0 0 0 0 0 0 0 0 0 0 0 0 0 0\"" );
 		}
 		return;
 	}
 
 	for ( i = 0; i < MOBA_ABILITIES_PER_HERO; i++ )
 	{
+		const mobaAbility_t *ab = &mobaHeroes[p->heroId].abilities[i];
+		int end = 0;
+
 		cd[i] = ( p->cdReady[i] > level.time ) ? ( p->cdReady[i] - level.time ) : 0;
 		lv[i] = p->abilityLevel[i];
+
+		// the effect time is only meaningful for the slots that leave something
+		// running on the caster, the damage slots report zero
+		switch ( ab->type )
+		{
+		case AB_BUFF:		end = p->buffEndTime;		break;
+		case AB_SHIELD:		end = p->shieldEndTime;		break;
+		case AB_MAGICRESIST:end = p->magicResistEndTime;	break;
+		case AB_FLAME:		end = p->flameUntil;		break;
+		default:			end = 0;					break;
+		}
+
+		eff[i] = ( end > level.time ) ? ( end - level.time ) : 0;
 	}
 
-	Com_sprintf( buf, sizeof( buf ), "%i %i %i %i %i %i %i %i %i", p->heroId,
-		cd[0], cd[1], cd[2], cd[3], lv[0], lv[1], lv[2], lv[3] );
+	Com_sprintf( buf, sizeof( buf ), "%i %i %i %i %i %i %i %i %i %i %i %i %i %i %i",
+		p->heroId,
+		cd[0], cd[1], cd[2], cd[3], lv[0], lv[1], lv[2], lv[3],
+		p->mana, mobaHeroes[p->heroId].maxMana,
+		eff[0], eff[1], eff[2], eff[3] );
 
 	if ( Q_stricmp( buf, mobaAbilitiesSent[clientNum] ) == 0 )
 	{
@@ -1763,6 +2305,217 @@ static void MOBA_PushAbilityState( int clientNum )
 	mobaAbilitiesNext[clientNum] = level.time + 200;
 	Q_strncpyz( mobaAbilitiesSent[clientNum], buf, sizeof( mobaAbilitiesSent[clientNum] ) );
 	trap->SendServerCommand( ent->s.number, va( "mobaAbilities \"%s\"", buf ) );
+}
+
+//=========================================================================
+// The flame channel. The client repeats the cast while the key is held, every
+// repeat only pushed flameUntil forward; the actual damage and the actual mana
+// cost are paid here, once per frame, so holding the key for twice as long
+// costs twice as much and deals twice as much.
+//=========================================================================
+static void MOBA_TickFlame( int clientNum )
+{
+	mobaPlayer_t *p = &mobaPlayers[clientNum];
+	gentity_t *ent;
+	const mobaAbility_t *ab;
+	int dt, i;
+
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS || !p->inuse )
+	{
+		return;
+	}
+
+	if ( p->flameUntil <= level.time )
+	{
+		// the channel just ended: douse the hand effect and drop the casting
+		// pose, otherwise the fire would keep burning on an idle player
+		if ( p->flameSlot >= 0 )
+		{
+			ent = &g_entities[clientNum];
+
+			if ( ent->inuse && ent->client )
+			{
+				ent->client->ps.activeForcePass = 0;
+
+				if ( ent->client->ps.torsoAnim == BOTH_FORCELIGHTNING_HOLD )
+				{
+					ent->client->ps.torsoAnim = BOTH_STAND1;
+					ent->client->ps.torsoTimer = 0;
+				}
+			}
+		}
+
+		p->flameSlot = -1;
+		return;
+	}
+
+	if ( p->heroId < 0 || p->heroId >= mobaNumHeroes )
+	{
+		p->flameUntil = 0;
+		return;
+	}
+
+	if ( p->flameSlot < 0 || p->flameSlot >= MOBA_ABILITIES_PER_HERO )
+	{
+		p->flameUntil = 0;
+		return;
+	}
+
+	ent = &g_entities[clientNum];
+
+	if ( !ent->inuse || !ent->client )
+	{
+		return;
+	}
+
+	ab = &mobaHeroes[p->heroId].abilities[p->flameSlot];
+	if ( ab->type != AB_FLAME )
+	{
+		p->flameUntil = 0;
+		p->flameSlot = -1;
+		return;
+	}
+
+	// out of mana: the fire dies right here, the next cast has to wait for it
+	if ( p->mana <= 0 )
+	{
+		p->flameUntil = 0;
+		p->flameSlot = -1;
+		MOBA_CPSelf( ent, "%s went out: no mana\n", ab->name );
+		return;
+	}
+
+	dt = level.time - p->flameTick;
+	if ( dt <= 0 )
+	{
+		return;
+	}
+	if ( dt > MOBA_FLAME_MAX_TICK_MS )
+	{
+		dt = MOBA_FLAME_MAX_TICK_MS;
+	}
+	p->flameTick = level.time;
+
+	// mana per second, accumulated as milli-mana so a short tick still costs
+	// its exact share and only whole points leave the pool
+	p->flameManaFrac += ab->manaCost * dt;
+	{
+		int mana = p->flameManaFrac / 1000;
+
+		p->flameManaFrac %= 1000;
+
+		if ( mana > p->mana )
+		{
+			mana = p->mana;
+			p->flameUntil = 0;
+		}
+		p->mana -= mana;
+	}
+
+	// The visible flame. boba-fett.pk3 overrides effects/force/lightning.efx so
+	// the force-lightning effect is drawn with fire shaders and the lightning
+	// sound is a fire crackle. The cgame already draws that effect from the
+	// caster's hand whenever activeForcePass is set, so we light that flag and
+	// hold the lightning pose; extra puffs are dropped along the cone so the
+	// stream reaches the target instead of hugging the hand.
+	{
+		vec3_t fwd, org, end, delta;
+		float reach;
+		int fx = G_EffectIndex( "force/lightning" );
+
+		AngleVectors( ent->client->ps.viewangles, fwd, NULL, NULL );
+
+		VectorCopy( ent->client->ps.origin, org );
+		org[2] += ent->client->ps.viewheight - 6.0f;
+		VectorMA( org, 6.0f, fwd, org );
+
+		// where the stream stops: the first wall or the end of the range
+		VectorMA( org, ab->range, fwd, end );
+		{
+			trace_t tr;
+
+			trap->Trace( &tr, org, vec3_origin, vec3_origin, end, ent->s.number, MASK_SHOT, qfalse, 0, 0 );
+			VectorCopy( tr.endpos, end );
+		}
+
+		// the muzzle burst rides every frame, the puffs further down the cone
+		// and the sound are throttled so a held channel does not swamp the
+		// temp-entity pool
+		G_PlayEffectID( fx, org, fwd );
+
+		VectorSubtract( end, org, delta );
+		reach = VectorLength( delta );
+
+		if ( level.time >= p->flameFxTime )
+		{
+			vec3_t mid;
+
+			p->flameFxTime = level.time + 100;
+
+			if ( reach > 80.0f )
+			{
+				VectorMA( org, 0.5f, delta, mid );
+				G_PlayEffectID( fx, mid, fwd );
+			}
+
+			G_PlayEffectID( fx, end, fwd );
+		}
+
+		if ( level.time >= p->flameSndTime )
+		{
+			p->flameSndTime = level.time + 400;
+			G_Sound( ent, CHAN_AUTO, G_SoundIndex( "sound/weapons/force/lightning" ) );
+		}
+
+		ent->client->ps.activeForcePass = 1;
+
+		G_SetAnim( ent, NULL, SETANIM_TORSO, BOTH_FORCELIGHTNING_HOLD,
+			SETANIM_FLAG_OVERRIDE | SETANIM_FLAG_HOLD, 0 );
+		ent->client->ps.torsoTimer = 1;
+	}
+
+	// damage per second over every hostile caught in the cone in front
+	p->flameDmgAcc += ab->baseEffect * dt;
+	{
+		int dmg = p->flameDmgAcc / 1000;
+
+		p->flameDmgAcc %= 1000;
+
+		if ( dmg > 0 )
+		{
+			vec3_t fwd;
+
+			AngleVectors( ent->client->ps.viewangles, fwd, NULL, NULL );
+
+			for ( i = 0; i < level.maxclients; i++ )
+			{
+				gentity_t *target = &g_entities[i];
+				vec3_t dir;
+				float dist;
+
+				if ( !target->inuse || !target->client || !MOBA_IsHostile( ent, target ) )
+				{
+					continue;
+				}
+
+				VectorSubtract( target->client->ps.origin, ent->client->ps.origin, dir );
+				dist = VectorLength( dir );
+				if ( dist > ab->range || dist < 1.0f )
+				{
+					continue;
+				}
+
+				// a cone, not a ball: the flame only burns what stands in front
+				VectorScale( dir, 1.0f / dist, dir );
+				if ( DotProduct( dir, fwd ) < 0.5f )
+				{
+					continue;
+				}
+
+				G_Damage( target, ent, ent, dir, target->client->ps.origin, dmg, 0, MOD_MOBA );
+			}
+		}
+	}
 }
 
 void MOBA_RunFrame( void )
@@ -1786,26 +2539,51 @@ void MOBA_RunFrame( void )
 
 	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
 	{
+		MOBA_TickMana( i );
+		MOBA_TickFlame( i );
+		MOBA_TickItems( i );
 		MOBA_PushShopState( i );
 		MOBA_PushDraftState( i );
 		MOBA_PushAbilityState( i );
 	}
+
+	MOBA_PushDraftOwners();
+
+	// the launcher's players/stats tab polls this file, refresh it twice a second
+	MOBA_WriteStatusFile();
 
 	switch ( mobaPhase )
 	{
 	case MOBA_PHASE_LOBBY:
 		if ( level.numConnectedClients >= 2 )
 		{
-			// the draft runs once per match, every later round goes straight to
-			// the shop with the lineup of the first one
-			if ( mobaDraftDone )
+			if ( !mobaLobbyStart )
 			{
-				MOBA_StartBuy();
+				mobaLobbyStart = level.time;
+				MOBA_CPAll( "^3The match starts in %i s^7 - type ^3!ready^7 to begin "
+					"as soon as everybody is here\n", moba_lobbyTime.integer );
 			}
-			else
+
+			// everyone expected (up to sv_maxclients) typed !ready, or the lobby
+			// fallback time ran out: launch. The draft runs once per match, every
+			// later round goes straight to the shop with the lineup of the first one.
+			if ( MOBA_AllReady() ||
+				level.time >= mobaLobbyStart + moba_lobbyTime.integer * 1000 )
 			{
-				MOBA_StartDraft();
+				mobaLobbyStart = 0;
+				if ( mobaDraftDone )
+				{
+					MOBA_StartBuy();
+				}
+				else
+				{
+					MOBA_StartDraft();
+				}
 			}
+		}
+		else
+		{
+			mobaLobbyStart = 0;
 		}
 		break;
 
@@ -1889,6 +2667,12 @@ void MOBA_RunFrame( void )
 			{
 				MOBA_StartRoundEnd();
 			}
+		}
+		else if ( mobaPhaseEnd && level.time >= mobaPhaseEnd )
+		{
+			// the round clock ran out before a team was wiped out
+			MOBA_CPAll( "^3The round time is up!\n" );
+			MOBA_StartRoundEnd();
 		}
 		break;
 
@@ -1990,20 +2774,70 @@ qboolean MOBA_ShouldBlockDamage( gentity_t *targ, gentity_t *attacker )
 	return qfalse;
 }
 
-int MOBA_AdjustDamage( gentity_t *targ, gentity_t *attacker, int damage )
+int MOBA_AdjustDamage( gentity_t *targ, gentity_t *attacker, gentity_t *inflictor, int meansOfDeath, int damage )
 {
 	mobaPlayer_t *p;
 	float mult;
 
+	if ( !mobaEnabled )
+	{
+		return damage;
+	}
+
+	// The target side runs first and stands on its own: a shield or a magic
+	// resistance buff has to work no matter who dealt the blow, even against an
+	// attacker that has no client slot at all (a missile's shooter is a player,
+	// but scripted entities can deal damage too).
+	if ( targ && targ->client && targ->s.number >= 0 && targ->s.number < MAX_CLIENTS )
+	{
+		mobaPlayer_t *t = &mobaPlayers[targ->s.number];
+
+		// only ability and projectile damage counts as magic, a saber hit is not
+		// reduced by the priest's blessing
+		if ( meansOfDeath == MOD_MOBA && t->magicResistEndTime > level.time && damage > 0 )
+		{
+			damage = (int)( damage * 0.5f );
+			if ( damage < 1 )
+			{
+				damage = 1;
+			}
+		}
+
+		// the shield eats what it can and lets the rest through, a fully absorbed
+		// hit deals no damage at all
+		if ( t->shieldEndTime > level.time && t->shieldAmount > 0 && damage > 0 )
+		{
+			if ( damage <= t->shieldAmount )
+			{
+				t->shieldAmount -= damage;
+				damage = 0;
+			}
+			else
+			{
+				damage -= t->shieldAmount;
+				t->shieldAmount = 0;
+			}
+		}
+	}
+
+	if ( damage <= 0 )
+	{
+		return 0;
+	}
+
 	// vehicles and other scripted entities carry a client pointer but do not
 	// sit in a client slot, they must never index the player array
-	if ( !mobaEnabled || !attacker || !attacker->client || targ == attacker ||
+	if ( !attacker || !attacker->client || targ == attacker ||
 		attacker->s.number < 0 || attacker->s.number >= MAX_CLIENTS )
 	{
 		return damage;
 	}
 
 	p = &mobaPlayers[attacker->s.number];
+
+	// the cloak only hides a player who stays off the damage lists, so the
+	// first thing this player deals ends it
+	MOBA_BreakInvis( attacker );
 
 	if ( p->buffEndTime > level.time )
 	{
@@ -2060,7 +2894,18 @@ static void MOBA_ApplyHeroStats( gentity_t *ent )
 	h = &mobaHeroes[p->heroId];
 
 	health = h->baseHealth + p->level * h->healthPerLevel;
-	armor = h->baseArmor;
+
+	// Heroes start without any armor. Everything the player walks around with has
+	// to be bought in the shop or earned by the umbrella, so the base armor of the
+	// hero table is only kept as a balance reference and is never handed out.
+	armor = 0;
+
+	// the umbrella is not a bonus in the item table, it is a temporary armor
+	// pool that only exists while the shield is up
+	if ( p->umbrellaEndTime > level.time )
+	{
+		armor += MOBA_ITEM_UMBRELLA_ARMOR;
+	}
 
 	for ( i = 0; i < mobaNumItems; i++ )
 	{
@@ -2160,9 +3005,12 @@ static void MOBA_ApplyHeroModel( gentity_t *ent )
 		return;
 	}
 
-	Info_SetValueForKey( userinfo, "model", want );
-	trap->SetUserinfo( num, userinfo );
-	ClientUserinfoChanged( num );
+	if ( moba_rebrandModel.integer )
+	{
+		Info_SetValueForKey( userinfo, "model", want );
+		trap->SetUserinfo( num, userinfo );
+		ClientUserinfoChanged( num );
+	}
 }
 
 void MOBA_OnClientSpawn( gentity_t *ent )
@@ -2187,7 +3035,7 @@ void MOBA_OnClientSpawn( gentity_t *ent )
 			"^3B^7 - open or close the shop window in the buy phase,\n"
 			"^3ESC^7 closes the shop, a left click buys the item under it,\n"
 			"!buy N|code - buy, !buyall - buy everything affordable,\n"
-			"!upgrade N - upgrade ability, ^3Q E C V^7 - abilities on the bar,\n"
+			"!upgrade N - upgrade ability, ^3Q E^7 - abilities, ^3C V^7 - item slots,\n"
 			"!buyback - return after death, !status - stats, !help - all commands\n",
 			MOBA_ModeName() );
 	}
@@ -2219,6 +3067,25 @@ void MOBA_OnClientDisconnect( gentity_t *ent )
 		mobaPlayers[ent->s.number].heroId = -1;
 		mobaPlayers[ent->s.number].autoCmdNext = 0;
 		mobaPlayers[ent->s.number].autoCmdIdx = 0;
+		MOBA_ResetPlayerSlots( &mobaPlayers[ent->s.number] );
+
+		// A cloak that was running dies with the client, so the viewers are told
+		// to stop drawing a ghost, and both rows and the column of the slot are
+		// cleared: a client that comes back into this slot would otherwise be
+		// skipped as "already told" and would draw a body nobody else sees.
+		MOBA_ClearInvis( ent->s.number );
+		memset( mobaInvisSent[ent->s.number], 0, sizeof( mobaInvisSent[ent->s.number] ) );
+		{
+			int i;
+
+			for ( i = 0; i < MAX_CLIENTS; i++ )
+			{
+				mobaInvisSent[i][ent->s.number] = 0;
+			}
+		}
+		mobaReady[ent->s.number] = qfalse;
+		mobaRestartVoted[ent->s.number] = qfalse;
+		mobaFFVoted[ent->s.number] = qfalse;
 		mobaLastSent[ent->s.number][0] = '\0';
 		mobaShopStateLogged[ent->s.number] = qfalse;
 		mobaLastDraftSent[ent->s.number][0] = '\0';
@@ -2265,9 +3132,29 @@ void MOBA_OnPlayerDeath( gentity_t *self, gentity_t *attacker, int meansOfDeath 
 
 	vp = &mobaPlayers[self->s.number];
 	vp->dead = qtrue;
+	vp->deaths++;
+
+	// a flame channel dies with its caster, otherwise the corpse would keep
+	// breathing fire until the next respawn
+	vp->flameUntil = 0;
+	vp->flameSlot = -1;
+	self->client->ps.activeForcePass = 0;
+
+	// the cloak and the umbrella die with the body too, a respawn must not hand
+	// out a free extra eight seconds of invisibility
+	vp->invisEndTime = 0;
+	vp->invisStartTime = 0;
+	vp->umbrellaEndTime = 0;
+	MOBA_ClearInvis( self->s.number );
 
 	// never auto-respawn during a fight round
 	self->client->respawnTime = level.time + MOBA_FALLBACK_RESPAWN;
+
+	// let the fallen watch their team: a client with an active tempSpectate is
+	// routed through the free spectator camera, so it can fly over the fight
+	// until the next buy phase respawns everybody. Cleared again on respawn and
+	// buyback.
+	self->client->tempSpectate = level.time + MOBA_FALLBACK_RESPAWN;
 
 	// vehicles and scripted entities have a client pointer but no client slot
 	if ( attacker && attacker->client &&
@@ -2280,6 +3167,7 @@ void MOBA_OnPlayerDeath( gentity_t *self, gentity_t *attacker, int meansOfDeath 
 		goldGain = MOBA_GOLD_KILL;
 		kp->gold += goldGain;
 		kp->roundKills++;
+		kp->kills++;
 
 		// the reward follows the level of the hero that was killed, farming a
 		// weak hero pays less than taking on a developed one
@@ -2330,6 +3218,7 @@ gentity_t *MOBA_PickSpawnPoint( gentity_t *ent, vec3_t origin, vec3_t angles )
 				ents[count++] = spot;
 			}
 		}
+	}
 
 	if ( count > 0 )
 	{
@@ -2389,7 +3278,6 @@ gentity_t *MOBA_PickSpawnPoint( gentity_t *ent, vec3_t origin, vec3_t angles )
 		VectorCopy( spot->s.angles, angles );
 		angles[PITCH] = 0;
 		return spot;
-	}
 	}
 
 	return SelectSpawnPoint( ent->client->ps.origin, origin, angles, team, qfalse );
@@ -2558,6 +3446,205 @@ static void MOBA_CastBuff( gentity_t *ent, const mobaAbility_t *ab )
 		ab->name, ab->buffMult, ab->durationMs / 1000.0f );
 }
 
+// The leap is a short teleport with a landing shock: the trace keeps the body
+// out of the wall it would fly into, and everybody hostile caught at the landing
+// spot is knocked off their feet and takes the landing damage.
+static void MOBA_CastLeap( gentity_t *ent, const mobaAbility_t *ab )
+{
+	trace_t tr;
+	vec3_t fwd, start, end, landOrigin;
+	int i, dmg = MOBA_AbilityPower( ent, ab );
+
+	// A forward dash: the view pitch is dropped so the leap always covers the
+	// same ground, and the whole body box is traced instead of a point. A point
+	// stops on the very surface of a wall and then the body pokes into it, which
+	// is exactly how the hero used to get stuck in a texture or in another hero.
+	AngleVectors( ent->client->ps.viewangles, fwd, NULL, NULL );
+	fwd[2] = 0.0f;
+	if ( VectorNormalize( fwd ) == 0.0f )
+	{
+		fwd[0] = 1.0f;
+	}
+
+	VectorCopy( ent->r.currentOrigin, start );
+	VectorMA( start, ab->range, fwd, end );
+
+	trap->Trace( &tr, start, ent->r.mins, ent->r.maxs, end, ent->s.number,
+		MASK_PLAYERSOLID, qfalse, 0, 0 );
+
+	if ( tr.startsolid || tr.allsolid )
+	{
+		MOBA_CPSelf( ent, "%s needs room to land\n", ab->name );
+		return;
+	}
+
+	VectorCopy( tr.endpos, landOrigin );
+
+	// if the dash stopped in mid air, look for the floor below so the hero does
+	// not hang there and then drop out of the fight
+	{
+		trace_t down;
+
+		VectorCopy( landOrigin, end );
+		end[2] -= 256.0f;
+		trap->Trace( &down, landOrigin, ent->r.mins, ent->r.maxs, end, ent->s.number,
+			MASK_PLAYERSOLID, qfalse, 0, 0 );
+
+		if ( down.fraction < 1.0f && !down.startsolid && !down.allsolid )
+		{
+			VectorCopy( down.endpos, landOrigin );
+		}
+	}
+
+	// unlink, move, link, the same dance TeleportPlayer does: the entity has to
+	// leave the world tree before its box moves, or it stays linked at the old
+	// spot and everything else keeps colliding with the ghost
+	trap->UnlinkEntity( (sharedEntity_t *)ent );
+	G_SetOrigin( ent, landOrigin );
+	VectorCopy( landOrigin, ent->client->ps.origin );
+	VectorClear( ent->client->ps.velocity );
+	ent->client->ps.eFlags ^= EF_TELEPORT_BIT;
+	trap->LinkEntity( (sharedEntity_t *)ent );
+
+	for ( i = 0; i < level.maxclients; i++ )
+	{
+		gentity_t *target = &g_entities[i];
+		vec3_t dir;
+
+		if ( !target->inuse || !target->client || !MOBA_IsHostile( ent, target ) )
+		{
+			continue;
+		}
+
+		VectorSubtract( target->client->ps.origin, landOrigin, dir );
+		if ( VectorLength( dir ) <= ab->radius )
+		{
+			G_Damage( target, ent, ent, dir, target->client->ps.origin, dmg, 0, MOD_MOBA );
+			G_Knockdown( target );
+		}
+	}
+
+	MOBA_CPSelf( ent, "%s! Landed with %i damage\n", ab->name, dmg );
+}
+
+// A shield is a pool of health that sits in front of the real one: it is spent
+// by damage in MOBA_AdjustDamage and runs out on its own.
+static void MOBA_CastShield( gentity_t *ent, const mobaAbility_t *ab )
+{
+	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
+	int amount = MOBA_AbilityPower( ent, ab );
+
+	p->shieldAmount = amount;
+	p->shieldEndTime = level.time + ab->durationMs;
+	p->effectEndTime[1] = p->shieldEndTime;
+
+	MOBA_CPSelf( ent, "%s! Shield absorbs %i for %.0f sec\n",
+		ab->name, amount, ab->durationMs / 1000.0f );
+}
+
+// The fireball is a blaster bolt with a slower travel and a slow on impact. It
+// is spawned exactly like WP_FireBlasterMissile does, only the classname and the
+// method of death differ, and G_MissileImpact sees the classname to call back
+// into MOBA_OnMissileImpact for the slow.
+static void MOBA_CastProjectile( gentity_t *ent, const mobaAbility_t *ab )
+{
+	vec3_t fwd, start;
+	gentity_t *missile;
+	int dmg = MOBA_AbilityPower( ent, ab );
+
+	AngleVectors( ent->client->ps.viewangles, fwd, NULL, NULL );
+	VectorCopy( ent->client->ps.origin, start );
+	start[2] += 24.0f;
+
+	// half the blaster velocity, so the bolt is visibly on its way and can be
+	// dodged instead of being an instant hit
+	missile = CreateMissile( start, fwd, 1150.0f, 10000, ent, qfalse );
+
+	if ( missile )
+	{
+		missile->classname = "moba_fireball";
+		missile->s.weapon = WP_BLASTER;
+		missile->damage = dmg;
+		missile->dflags = 0;
+		missile->methodOfDeath = MOD_MOBA;
+		missile->clipmask = MASK_SHOT | CONTENTS_LIGHTSABER;
+		missile->bounceCount = 8;
+	}
+}
+
+// The flame is a channel, not a single cast: the client repeats the cast while
+// the key is held and every repeat only extends the lit time. The mana and the
+// damage then drip in MOBA_TickFlame, so the cost follows the time held.
+static void MOBA_CastFlame( gentity_t *ent, const mobaAbility_t *ab, int slot )
+{
+	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
+
+	if ( p->flameUntil <= level.time || p->flameSlot != slot )
+	{
+		p->flameTick = level.time;
+		p->flameDmgAcc = 0;
+		p->flameManaFrac = 0;
+		p->flameFxTime = 0;
+	}
+
+	p->flameSlot = slot;
+	p->flameUntil = level.time + MOBA_FLAME_GRACE_MS;
+}
+
+// Silence does not touch the movement or the saber, it only sets the flag the
+// cast path checks, so a silenced enemy can still run and swing but not cast.
+static void MOBA_CastSilence( gentity_t *ent, const mobaAbility_t *ab )
+{
+	int i, count = 0;
+
+	for ( i = 0; i < level.maxclients; i++ )
+	{
+		gentity_t *target = &g_entities[i];
+		vec3_t dir;
+
+		if ( !target->inuse || !target->client || !MOBA_IsHostile( ent, target ) )
+		{
+			continue;
+		}
+
+		VectorSubtract( target->client->ps.origin, ent->client->ps.origin, dir );
+		if ( VectorLength( dir ) <= ab->radius )
+		{
+			mobaPlayers[i].silenceEndTime = level.time + ab->durationMs;
+			count++;
+		}
+	}
+
+	MOBA_CPSelf( ent, "%s! Silenced %i enemies for %.0f sec\n",
+		ab->name, count, ab->durationMs / 1000.0f );
+}
+
+static void MOBA_CastMagicResist( gentity_t *ent, const mobaAbility_t *ab )
+{
+	int i, count = 0;
+
+	for ( i = 0; i < level.maxclients; i++ )
+	{
+		gentity_t *target = &g_entities[i];
+		vec3_t dir;
+
+		if ( !target->inuse || !target->client || !MOBA_IsAlly( ent, target ) )
+		{
+			continue;
+		}
+
+		VectorSubtract( target->client->ps.origin, ent->client->ps.origin, dir );
+		if ( VectorLength( dir ) <= ab->radius )
+		{
+			mobaPlayers[i].magicResistEndTime = level.time + ab->durationMs;
+			count++;
+		}
+	}
+
+	MOBA_CPSelf( ent, "%s! %i allies take half magic damage for %.0f sec\n",
+		ab->name, count, ab->durationMs / 1000.0f );
+}
+
 // ability power scales with the rank the player bought
 static int MOBA_AbilityRank( gentity_t *ent, const mobaAbility_t *ab )
 {
@@ -2619,11 +3706,58 @@ static void MOBA_CastAbility( gentity_t *ent, int slot )
 	h = &mobaHeroes[p->heroId];
 	ab = &h->abilities[slot];
 
-	if ( level.time < p->cdReady[slot] )
+	// silenced: the one thing a silence stops is casting, the saber still swings
+	if ( p->silenceEndTime > level.time )
+	{
+		MOBA_CPSelf( ent, "You are silenced for %i sec!\n",
+			( p->silenceEndTime - level.time ) / 1000 + 1 );
+		return;
+	}
+
+	// a charged ability refills as soon as its cooldown is over; the cooldown is
+	// only ever started by the last charge, not by every shot
+	if ( ab->type == AB_PROJECTILE && p->charges[slot] == 0 &&
+		level.time >= p->cdReady[slot] )
+	{
+		p->charges[slot] = MOBA_PROJECTILE_CHARGES;
+	}
+
+	if ( p->charges[slot] >= 0 )
+	{
+		if ( p->charges[slot] <= 0 )
+		{
+			MOBA_CPSelf( ent, "%s is reloading (%i sec)\n",
+				ab->name, ( p->cdReady[slot] - level.time ) / 1000 + 1 );
+			return;
+		}
+	}
+	else if ( level.time < p->cdReady[slot] )
 	{
 		MOBA_CPSelf( ent, "%s on cooldown (%i sec)\n",
 			ab->name, ( p->cdReady[slot] - level.time ) / 1000 + 1 );
 		return;
+	}
+
+	// the flame is paid for by the second while it burns, every other ability
+	// pays its cost up front
+	if ( ab->type == AB_FLAME )
+	{
+		if ( p->mana <= 0 )
+		{
+			MOBA_CPSelf( ent, "Out of mana for %s\n", ab->name );
+			return;
+		}
+	}
+	else
+	{
+		if ( p->mana < ab->manaCost )
+		{
+			MOBA_CPSelf( ent, "Not enough mana for %s (%i needed)\n",
+				ab->name, ab->manaCost );
+			return;
+		}
+
+		p->mana -= ab->manaCost;
 	}
 
 	switch ( ab->type )
@@ -2640,11 +3774,124 @@ static void MOBA_CastAbility( gentity_t *ent, int slot )
 	case AB_BUFF:
 		MOBA_CastBuff( ent, ab );
 		break;
+	case AB_LEAP:
+		MOBA_CastLeap( ent, ab );
+		break;
+	case AB_SHIELD:
+		MOBA_CastShield( ent, ab );
+		break;
+	case AB_PROJECTILE:
+		MOBA_CastProjectile( ent, ab );
+		break;
+	case AB_FLAME:
+		MOBA_CastFlame( ent, ab, slot );
+		break;
+	case AB_SILENCE:
+		MOBA_CastSilence( ent, ab );
+		break;
+	case AB_MAGICRESIST:
+		MOBA_CastMagicResist( ent, ab );
+		break;
 	default:
 		return;
 	}
 
-	p->cdReady[slot] = level.time + ab->cooldownMs;
+	// a charge is spent per cast and only the last one starts the cooldown; the
+	// flame has no cooldown at all, it lives as long as its cost is paid
+	if ( p->charges[slot] >= 0 )
+	{
+		p->charges[slot]--;
+		if ( p->charges[slot] <= 0 )
+		{
+			p->cdReady[slot] = level.time + ab->cooldownMs;
+		}
+	}
+	else if ( ab->type != AB_FLAME )
+	{
+		p->cdReady[slot] = level.time + ab->cooldownMs;
+	}
+}
+
+//=========================================================================
+// Slow and missile callbacks
+//=========================================================================
+
+// Called from ClientThink once the command of the frame is final. A slow only
+// touches the two movement axes; looking, shooting and force stay untouched, so
+// a slowed player can still fight, just not run.
+void MOBA_ClientThink( gentity_t *ent )
+{
+	mobaPlayer_t *p;
+
+	if ( !mobaEnabled || !ent || !ent->client )
+	{
+		return;
+	}
+
+	if ( ent->s.number < 0 || ent->s.number >= MAX_CLIENTS )
+	{
+		return;
+	}
+
+	p = &mobaPlayers[ent->s.number];
+
+	if ( p->slowEndTime <= level.time )
+	{
+		if ( p->slowPct != 0.0f )
+		{
+			p->slowPct = 0.0f;
+		}
+		return;
+	}
+
+	if ( p->slowPct > 0.0f )
+	{
+		float keep = 1.0f - p->slowPct;
+
+		if ( keep < 0.0f )
+		{
+			keep = 0.0f;
+		}
+
+		ent->client->pers.cmd.forwardmove = (int)( ent->client->pers.cmd.forwardmove * keep );
+		ent->client->pers.cmd.rightmove = (int)( ent->client->pers.cmd.rightmove * keep );
+	}
+}
+
+// The fireball carries its own classname, so G_MissileImpact calls back here the
+// moment the bolt lands on a body and the slow is applied from the hit itself
+// instead of being guessed out of a damage event.
+void MOBA_OnMissileImpact( gentity_t *missile, gentity_t *other )
+{
+	gentity_t *owner;
+	mobaPlayer_t *t;
+
+	if ( !mobaEnabled || !missile || !other )
+	{
+		return;
+	}
+
+	if ( !other->client || other->s.number < 0 || other->s.number >= MAX_CLIENTS )
+	{
+		return;
+	}
+
+	owner = &g_entities[missile->r.ownerNum];
+
+	// never slow a teammate, a friendly fire bolt should not be a tool
+	if ( owner->client && OnSameTeam( owner, other ) )
+	{
+		return;
+	}
+
+	t = &mobaPlayers[other->s.number];
+
+	// the strongest slow wins and refreshes, a weaker one never shortens it
+	if ( MOBA_FIREBALL_SLOW_PCT >= t->slowPct || t->slowEndTime <= level.time )
+	{
+		t->slowPct = MOBA_FIREBALL_SLOW_PCT;
+	}
+	t->slowEndTime = level.time + MOBA_FIREBALL_SLOW_MS;
 }
 
 //=========================================================================
@@ -2753,41 +4000,177 @@ static int MOBA_ResolveItem( gentity_t *ent, const char *arg )
 }
 
 //=========================================================================
+// Inventory slots
+//
+// A player owns exactly MOBA_ACTIVE_SLOTS items. Slot 0 is the C key, slot 1 the
+// V key, an item lives in exactly one of them and gives its passive bonuses for
+// as long as it sits there. A stackable item (the grenade) carries its charges
+// inside the slot instead of taking a second one.
+//=========================================================================
+
+// the slot that already holds this item, -1 when none of them does
+static int MOBA_FindSlotOf( const mobaPlayer_t *p, int id )
+{
+	int i;
+
+	for ( i = 0; i < MOBA_ACTIVE_SLOTS; i++ )
+	{
+		if ( p->slotItem[i] == id )
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+// the first empty slot, -1 when both are taken
+static int MOBA_FreeSlot( const mobaPlayer_t *p )
+{
+	int i;
+
+	for ( i = 0; i < MOBA_ACTIVE_SLOTS; i++ )
+	{
+		if ( p->slotItem[i] < 0 )
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+// the item mask is only a mirror of the slots, it exists because the stat code
+// and the shop window both want "which items are owned" as one bitfield
+static void MOBA_SyncItemMask( mobaPlayer_t *p )
+{
+	int i;
+
+	p->itemMask = 0;
+
+	for ( i = 0; i < MOBA_ACTIVE_SLOTS; i++ )
+	{
+		if ( p->slotItem[i] >= 0 && p->slotItem[i] < mobaNumItems )
+		{
+			p->itemMask |= ( 1 << p->slotItem[i] );
+		}
+	}
+}
+
+// Puts one copy of an item into the inventory and takes the gold for it. Every
+// reason a purchase can be refused is answered from here, so the shop window and
+// the !buyall command refuse a buy the same way the player reads it.
+static qboolean MOBA_TakeItem( gentity_t *ent, int id )
+{
+	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
+	int have, slot;
+
+	if ( id < 0 || id >= mobaNumItems )
+	{
+		return qfalse;
+	}
+
+	have = MOBA_FindSlotOf( p, id );
+
+	if ( have >= 0 && mobaItems[id].maxCount <= 1 )
+	{
+		MOBA_CPSelf( ent, "You already have %s!\n", mobaItems[id].name );
+		return qfalse;
+	}
+
+	if ( have >= 0 && p->slotCount[have] >= mobaItems[id].maxCount )
+	{
+		MOBA_CPSelf( ent, "You already carry the maximum of %i %s!\n",
+			mobaItems[id].maxCount, mobaItems[id].name );
+		return qfalse;
+	}
+
+	if ( have < 0 && MOBA_FreeSlot( p ) < 0 )
+	{
+		MOBA_CPSelf( ent, "Both item slots (%i and %i) are full!\n",
+			MOBA_ITEM_KEY_A, MOBA_ITEM_KEY_B );
+		return qfalse;
+	}
+
+	if ( p->gold < mobaItems[id].price )
+	{
+		MOBA_CPSelf( ent, "Not enough gold (%i/%i)!\n", p->gold, mobaItems[id].price );
+		return qfalse;
+	}
+
+	p->gold -= mobaItems[id].price;
+
+	if ( have >= 0 )
+	{
+		p->slotCount[have]++;
+		MOBA_CPSelf( ent, "%s x%i! %i gold left\n",
+			mobaItems[id].name, p->slotCount[have], p->gold );
+	}
+	else
+	{
+		slot = MOBA_FreeSlot( p );
+		p->slotItem[slot] = id;
+		p->slotCount[slot] = 1;
+		MOBA_CPSelf( ent, "Bought %s -> slot %c! %i gold left\n",
+			mobaItems[id].name, MOBA_ITEM_KEY_A + slot, p->gold );
+	}
+
+	MOBA_SyncItemMask( p );
+	MOBA_ApplyHeroStats( ent );
+
+	return qtrue;
+}
+
+//=========================================================================
 // Buys every item the player can still afford, cheapest first, so that a
-// single command fills out a round instead of one command per item.
+// single command fills out a round instead of one command per item. It stops
+// as soon as both slots are taken, that is the point of the slot limit.
 //=========================================================================
 static void MOBA_BuyAll( gentity_t *ent )
 {
 	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
-	qboolean bought[MOBA_MAX_ITEMS];
-	int i, j, boughtCount = 0;
+	int i, best, boughtCount = 0;
 
-	memset( bought, 0, sizeof( bought ) );
-
-	for ( j = 0; j < mobaNumItems; j++ )
+	while ( MOBA_FreeSlot( p ) >= 0 )
 	{
+		best = -1;
+
 		for ( i = 0; i < mobaNumItems; i++ )
 		{
-			if ( bought[i] || ( p->itemMask & ( 1 << i ) ) )
-			{
-				continue;
-			}
 			if ( p->gold < mobaItems[i].price )
 			{
 				continue;
 			}
-			MOBA_BuyItem( ent, i );
-			if ( p->itemMask & ( 1 << i ) )
+
+			// a stacking item can go on top of its own slot, everything else
+			// only fits into an empty one, which the while loop guarantees
+			if ( MOBA_FindSlotOf( p, i ) >= 0 && mobaItems[i].maxCount <= 1 )
 			{
-				bought[i] = qtrue;
-				boughtCount++;
+				continue;
+			}
+
+			if ( best < 0 || mobaItems[i].price < mobaItems[best].price )
+			{
+				best = i;
 			}
 		}
+
+		if ( best < 0 )
+		{
+			break;
+		}
+
+		if ( !MOBA_TakeItem( ent, best ) )
+		{
+			break;
+		}
+
+		boughtCount++;
 	}
 
 	if ( boughtCount == 0 )
 	{
-		MOBA_Self( ent, "^3Nothing bought: not enough gold for anything new (you have %i gold)", p->gold );
+		MOBA_Self( ent, "^3Nothing bought: not enough gold for an empty slot (you have %i gold)", p->gold );
 	}
 	else
 	{
@@ -2797,8 +4180,6 @@ static void MOBA_BuyAll( gentity_t *ent )
 
 static void MOBA_BuyItem( gentity_t *ent, int id )
 {
-	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
-
 	if ( mobaPhase != MOBA_PHASE_BUY )
 	{
 		MOBA_CPSelf( ent, "Buying is only allowed in the buy phase!\n" );
@@ -2807,7 +4188,8 @@ static void MOBA_BuyItem( gentity_t *ent, int id )
 
 	if ( id == -2 )
 	{
-		MOBA_Self( ent, "^3No item with that code. Codes: armor, med, rage, heavy, crystal, cloak" );
+		MOBA_Self( ent, "^3No item with that code. Codes: armor, med, rage, heavy, "
+			"crystal, shadowcloak, grenade, umbrella, inviscloak" );
 		return;
 	}
 
@@ -2823,24 +4205,430 @@ static void MOBA_BuyItem( gentity_t *ent, int id )
 		return;
 	}
 
-	if ( p->itemMask & ( 1 << id ) )
+	MOBA_TakeItem( ent, id );
+}
+
+//=========================================================================
+// Using an item
+//
+// The key press is answered here, never in the cgame: which slot was pressed,
+// what is in it, whether it is on cooldown, whether the key was pressed twice
+// and who is standing under the crosshair are all questions only the server can
+// answer, and a client that had the answer would simply lie about it.
+//=========================================================================
+extern gentity_t *WP_DropThermal( gentity_t *ent );
+
+// The ally the crosshair is on, or NULL. The trace runs over the same view the
+// client draws, so "aim at a friend" means the same thing on both sides, and a
+// client cannot reach further than MOBA_ITEM_MEDKIT_RANGE units.
+static gentity_t *MOBA_TraceAlly( gentity_t *ent, float range )
+{
+	vec3_t start, end, fwd;
+	trace_t tr;
+	gentity_t *t;
+
+	if ( !ent || !ent->client )
 	{
-		MOBA_CPSelf( ent, "You already have that item!\n" );
+		return NULL;
+	}
+
+	AngleVectors( ent->client->ps.viewangles, fwd, NULL, NULL );
+	VectorCopy( ent->client->ps.origin, start );
+	start[2] += 24.0f;
+	VectorMA( start, range, fwd, end );
+
+	trap->Trace( &tr, start, ent->r.mins, ent->r.maxs, end, ent->s.number,
+		MASK_SHOT, qfalse, 0, 0 );
+
+	if ( tr.entityNum <= 0 || tr.entityNum >= ENTITYNUM_WORLD )
+	{
+		return NULL;
+	}
+
+	t = &g_entities[ tr.entityNum ];
+
+	if ( !t->inuse || !t->client || t->client->ps.stats[STAT_HEALTH] <= 0 )
+	{
+		return NULL;
+	}
+
+	if ( t == ent )
+	{
+		return t;
+	}
+
+	return MOBA_IsAlly( ent, t ) ? t : NULL;
+}
+
+static qboolean MOBA_HealTarget( gentity_t *targ, int amount )
+{
+	int maxHealth, before;
+
+	if ( !targ || !targ->client )
+	{
+		return qfalse;
+	}
+
+	maxHealth = targ->client->ps.stats[STAT_MAX_HEALTH];
+
+	if ( maxHealth <= 0 )
+	{
+		maxHealth = MOBA_DEFAULT_MAXHEALTH;
+	}
+
+	before = targ->client->ps.stats[STAT_HEALTH];
+
+	if ( before >= maxHealth )
+	{
+		return qfalse;
+	}
+
+	targ->client->ps.stats[STAT_HEALTH] += amount;
+	if ( targ->client->ps.stats[STAT_HEALTH] > maxHealth )
+	{
+		targ->client->ps.stats[STAT_HEALTH] = maxHealth;
+	}
+
+	// G_Damage copies the stat back into the body, so a heal that only touches
+	// the stat would be gone the next time anything hurts that player
+	targ->health = targ->client->ps.stats[STAT_HEALTH];
+
+	return qtrue;
+}
+
+static void MOBA_UseMedKit( gentity_t *ent, int slot )
+{
+	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
+	gentity_t *targ;
+	qboolean doublePress;
+
+	// the press that lands inside the double press window asks for the owner
+	doublePress = ( level.time - p->slotLastUse[slot] ) <= MOBA_ITEM_DOUBLE_PRESS_MS;
+	targ = doublePress ? ent : MOBA_TraceAlly( ent, MOBA_ITEM_MEDKIT_RANGE );
+
+	// nothing to heal: the kit is not spent, but the slot still locks so the
+	// key cannot be mashed for a free target scan
+	if ( !targ || !MOBA_HealTarget( targ, MOBA_ITEM_MEDKIT_HEAL ) )
+	{
+		p->slotCdReady[slot] = level.time + MOBA_ITEM_MEDKIT_CD;
+		MOBA_CPSelf( ent, doublePress ?
+			"Med Kit: you are already at full health!\n" :
+			"Med Kit: no wounded ally within %i units!\n", (int)MOBA_ITEM_MEDKIT_RANGE );
 		return;
 	}
 
-	if ( p->gold < mobaItems[id].price )
+	p->slotCdReady[slot] = level.time + MOBA_ITEM_MEDKIT_CD;
+
+	if ( targ == ent )
 	{
-		MOBA_CPSelf( ent, "Not enough gold (%i/%i)!\n",
-			p->gold, mobaItems[id].price );
+		MOBA_CPSelf( ent, "Med Kit: +%i health\n", MOBA_ITEM_MEDKIT_HEAL );
 		return;
 	}
 
-	p->gold -= mobaItems[id].price;
-	p->itemMask |= ( 1 << id );
+	MOBA_CPAll( "%s healed %s for %i\n", ent->client->pers.netname,
+		targ->client->pers.netname, MOBA_ITEM_MEDKIT_HEAL );
+}
 
-	MOBA_CPSelf( ent, "Bought: %s! %i gold left\n",
-		mobaItems[id].name, p->gold );
+static void MOBA_UseGrenade( gentity_t *ent, int slot )
+{
+	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
+	gentity_t *grenade;
+
+	if ( p->slotCount[slot] <= 0 )
+	{
+		MOBA_CPSelf( ent, "No %s left in that slot!\n", mobaItems[ MOBA_ITEM_GRENADE ].name );
+		return;
+	}
+
+	grenade = WP_DropThermal( ent );
+
+	if ( !grenade )
+	{
+		MOBA_CPSelf( ent, "The %s did not come out!\n", mobaItems[ MOBA_ITEM_GRENADE ].name );
+		return;
+	}
+
+	p->slotCount[slot]--;
+	p->slotCdReady[slot] = level.time + MOBA_ITEM_GRENADE_CD;
+}
+
+static void MOBA_UseUmbrella( gentity_t *ent, int slot )
+{
+	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
+
+	if ( p->mana < MOBA_ITEM_UMBRELLA_MANA )
+	{
+		MOBA_CPSelf( ent, "Not enough mana for %s (%i needed)\n",
+			mobaItems[ MOBA_ITEM_UMBRELLA ].name, MOBA_ITEM_UMBRELLA_MANA );
+		return;
+	}
+
+	p->mana -= MOBA_ITEM_UMBRELLA_MANA;
+	p->umbrellaEndTime = level.time + MOBA_ITEM_UMBRELLA_DUR;
+
+	// the cooldown only starts once the shield is gone, so the slot is locked
+	// for the twenty seconds of the shield plus thirty more
+	p->slotCdReady[slot] = p->umbrellaEndTime + MOBA_ITEM_UMBRELLA_CD;
+
+	MOBA_ApplyHeroStats( ent );
+	MOBA_CPSelf( ent, "Umbrella up: +%i armor for %i sec\n",
+		MOBA_ITEM_UMBRELLA_ARMOR, MOBA_ITEM_UMBRELLA_DUR / 1000 );
+}
+
+static void MOBA_UseInvisCloak( gentity_t *ent, int slot )
+{
+	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
+
+	if ( p->mana < MOBA_ITEM_CLOAK_MANA )
+	{
+		MOBA_CPSelf( ent, "Not enough mana for %s (%i needed)\n",
+			mobaItems[ MOBA_ITEM_INVIS_CLOAK ].name, MOBA_ITEM_CLOAK_MANA );
+		return;
+	}
+
+	p->mana -= MOBA_ITEM_CLOAK_MANA;
+	p->invisStartTime = level.time;
+	p->invisEndTime = level.time + MOBA_ITEM_CLOAK_DUR;
+	p->slotCdReady[slot] = level.time + MOBA_ITEM_CLOAK_CD;
+
+	MOBA_CPSelf( ent, "Cloak on: invisible for %i sec, the next hit breaks it\n",
+		MOBA_ITEM_CLOAK_DUR / 1000 );
+}
+
+// One press of a slot key. The item has to sit in that slot, be activatable and
+// be off cooldown, then the item itself decides what a use means.
+static void MOBA_UseItem( gentity_t *ent, int slot )
+{
+	mobaPlayer_t *p;
+	const mobaItem_t *it;
+	int id;
+
+	if ( !mobaEnabled || !ent || !ent->client )
+	{
+		return;
+	}
+
+	if ( ent->s.number < 0 || ent->s.number >= MAX_CLIENTS )
+	{
+		return;
+	}
+
+	p = &mobaPlayers[ent->s.number];
+
+	if ( slot < 0 || slot >= MOBA_ACTIVE_SLOTS )
+	{
+		return;
+	}
+
+	if ( mobaPhase != MOBA_PHASE_FIGHT )
+	{
+		MOBA_CPSelf( ent, "Items only work in the fight phase!\n" );
+		return;
+	}
+
+	if ( p->heroId < 0 )
+	{
+		MOBA_CPSelf( ent, "Pick a hero first ( !pick N )!\n" );
+		return;
+	}
+
+	if ( p->dead || ent->client->ps.pm_type == PM_DEAD )
+	{
+		MOBA_CPSelf( ent, "You are dead!\n" );
+		return;
+	}
+
+	id = p->slotItem[slot];
+
+	if ( id < 0 || id >= mobaNumItems )
+	{
+		MOBA_CPSelf( ent, "Nothing in the %c slot\n", MOBA_ITEM_KEY_A + slot );
+		return;
+	}
+
+	it = &mobaItems[id];
+
+	if ( it->cooldownMs <= 0 )
+	{
+		MOBA_CPSelf( ent, "%s has no active use, it only gives its bonus\n", it->name );
+		return;
+	}
+
+	if ( level.time < p->slotCdReady[slot] )
+	{
+		MOBA_CPSelf( ent, "%s on cooldown (%i sec)\n",
+			it->name, ( p->slotCdReady[slot] - level.time + 999 ) / 1000 );
+		return;
+	}
+
+	// remembered after the use, a second press inside the window is the double
+	// press and means "on me"
+	p->slotLastUse[slot] = level.time;
+
+	switch ( id )
+	{
+	case MOBA_ITEM_MEDKIT:		MOBA_UseMedKit( ent, slot );		break;
+	case MOBA_ITEM_GRENADE:		MOBA_UseGrenade( ent, slot );		break;
+	case MOBA_ITEM_UMBRELLA:	MOBA_UseUmbrella( ent, slot );		break;
+	case MOBA_ITEM_INVIS_CLOAK:	MOBA_UseInvisCloak( ent, slot );	break;
+	default:
+		MOBA_CPSelf( ent, "%s cannot be used from a slot\n", it->name );
+		break;
+	}
+}
+
+//=========================================================================
+// The cloak, per viewer
+//
+// What one viewer is allowed to see of the cloaked player: nothing, a ghost or
+// the whole body. An enemy gets MOBA_INVIS_HIDDEN, everybody who is not an enemy
+// (own team, the wearer itself, a spectator) gets the ghost.
+static int MOBA_InvisModeFor( int viewerNum, int cloakedNum )
+{
+	gentity_t *viewer = &g_entities[viewerNum];
+
+	if ( viewerNum == cloakedNum ||
+		viewer->client->sess.sessionTeam == TEAM_SPECTATOR ||
+		OnSameTeam( viewer, &g_entities[cloakedNum] ) )
+	{
+		return MOBA_INVIS_GHOST;
+	}
+
+	return MOBA_INVIS_HIDDEN;
+}
+
+// Every client draws every player, so the cloak has to reach all of them and not
+// only the one who wears it. The value only changes once a second while the fade
+// runs, so a viewer gets at most one message a second and nothing at all while
+// nothing changes.
+static void MOBA_PushInvis( int clientNum )
+{
+	mobaPlayer_t *p = &mobaPlayers[clientNum];
+	int left = ( p->invisEndTime > level.time ) ? ( p->invisEndTime - level.time ) : 0;
+	int i;
+
+	if ( left <= 0 )
+	{
+		MOBA_ClearInvis( clientNum );
+		return;
+	}
+
+	// rounded to a second: the fade is a smooth ramp, the last bit of a
+	// millisecond is not worth a message per viewer per frame
+	left = ( ( left + 999 ) / 1000 ) * 1000;
+
+	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+	{
+		int mode, packed;
+
+		if ( !g_entities[i].client || !g_entities[i].client->pers.connected )
+		{
+			continue;
+		}
+
+		mode = MOBA_InvisModeFor( i, clientNum );
+
+		// the mode rides in the low bits, so a viewer that changes sides stops
+		// getting the old value even though the time did not move
+		packed = ( left << 2 ) | mode;
+
+		if ( packed == mobaInvisSent[clientNum][i] )
+		{
+			continue;
+		}
+
+		mobaInvisSent[clientNum][i] = packed;
+		trap->SendServerCommand( i, va( "mobaInvis %i %i %i", clientNum, left, mode ) );
+	}
+}
+
+// The cloak stopped: everybody who was told something is told that it stopped,
+// so no client is left with a body it still draws as a ghost.
+static void MOBA_ClearInvis( int clientNum )
+{
+	int i;
+
+	for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+	{
+		if ( mobaInvisSent[clientNum][i] == 0 )
+		{
+			continue;
+		}
+
+		mobaInvisSent[clientNum][i] = 0;
+
+		if ( g_entities[i].client )
+		{
+			trap->SendServerCommand( i, va( "mobaInvis %i 0 %i",
+				clientNum, MOBA_INVIS_NONE ) );
+		}
+	}
+}
+
+//=========================================================================
+// Item timers
+//=========================================================================
+static void MOBA_TickItems( int clientNum )
+{
+	mobaPlayer_t *p = &mobaPlayers[clientNum];
+	gentity_t *ent = &g_entities[clientNum];
+
+	if ( !p->inuse || !ent->client )
+	{
+		return;
+	}
+
+	// the shield is a fixed armor pool, so it has to be taken off the stat again
+	if ( p->umbrellaEndTime > 0 )
+	{
+		if ( p->umbrellaEndTime > level.time )
+		{
+			MOBA_PushInvis( clientNum );
+		}
+		else
+		{
+			p->umbrellaEndTime = 0;
+			MOBA_ApplyHeroStats( ent );
+		}
+	}
+
+	if ( p->invisEndTime > 0 )
+	{
+		if ( p->invisEndTime > level.time )
+		{
+			MOBA_PushInvis( clientNum );
+		}
+		else
+		{
+			p->invisEndTime = 0;
+			p->invisStartTime = 0;
+			MOBA_ClearInvis( clientNum );
+		}
+	}
+}
+
+// A hit breaks the cloak. Called from the damage path with the attacker as the
+// player, so a saber, an ability and a grenade all count as "any hit".
+static void MOBA_BreakInvis( gentity_t *attacker )
+{
+	mobaPlayer_t *p;
+
+	if ( !mobaEnabled || !attacker || !attacker->client ||
+		attacker->s.number < 0 || attacker->s.number >= MAX_CLIENTS )
+	{
+		return;
+	}
+
+	p = &mobaPlayers[attacker->s.number];
+
+	if ( p->invisEndTime <= level.time )
+	{
+		return;
+	}
+
+	p->invisEndTime = 0;
+	p->invisStartTime = 0;
+	MOBA_ClearInvis( attacker->s.number );
 }
 
 static void MOBA_UpgradeAbility( gentity_t *ent, int num )
@@ -2896,7 +4684,7 @@ static void MOBA_Buyback( gentity_t *ent )
 		return;
 	}
 
-	if ( !p->dead || ent->client->ps.pm_type != PM_DEAD )
+	if ( !p->dead )
 	{
 		MOBA_CPSelf( ent, "You are still alive!\n" );
 		return;
@@ -2912,6 +4700,7 @@ static void MOBA_Buyback( gentity_t *ent )
 
 	p->gold -= cost;
 	p->dead = qfalse;
+	ent->client->tempSpectate = 0;
 	ent->client->respawnTime = 0;
 
 	ClientRespawn( ent );
@@ -3001,7 +4790,35 @@ static qboolean MOBA_DraftHeroFromArg( gentity_t *ent, const char *arg, int *her
 // stage and of all pick.
 static void MOBA_GiveHero( gentity_t *ent, int heroId )
 {
-	mobaPlayers[ent->s.number].heroId = heroId;
+	mobaPlayer_t *p = &mobaPlayers[ent->s.number];
+	int i;
+
+	p->heroId = heroId;
+
+	// a fresh hero starts with a clean slate: no leftover shield, silence, slow
+	// or channel can survive a hero swap, only the fight state does
+	p->shieldEndTime = 0;
+	p->shieldAmount = 0;
+	p->silenceEndTime = 0;
+	p->magicResistEndTime = 0;
+	p->slowEndTime = 0;
+	p->slowPct = 0.0f;
+	p->flameUntil = 0;
+	p->flameSlot = -1;
+	p->flameTick = 0;
+	p->flameDmgAcc = 0;
+	p->flameManaFrac = 0;
+
+	for ( i = 0; i < MOBA_ABILITIES_PER_HERO; i++ )
+	{
+		p->effectEndTime[i] = 0;
+
+		// only the slow travelling bolt is a charged ability; everything else
+		// uses its cooldown the plain way and carries -1 charges
+		p->charges[i] = ( mobaHeroes[heroId].abilities[i].type == AB_PROJECTILE ) ?
+			MOBA_PROJECTILE_CHARGES : -1;
+	}
+
 	MOBA_ApplyHeroModel( ent );
 	MOBA_CPSelf( ent, "Hero picked: ^5%s^7!\n", mobaHeroes[heroId].name );
 	MOBA_LogLine( va( "%s plays %s", ent->client->pers.netname,
@@ -3189,18 +5006,31 @@ qboolean MOBA_HandleChat( gentity_t *ent, const char *msg )
 	if ( !Q_stricmp( cmd, "!help" ) )
 	{
 		MOBA_Self( ent, "^3Commands:^7 !heroes !pick N !ban N !buy N|code !buyall !upgrade N "
-			"!buyback !1-!4 (abilities) !status\n"
+			"!buyback !1-!%i (abilities) !use1 !use2 (items) !status\n"
 			"^3Draft (%s):^7 %s^7, ^3!draft^7 brings the hero window back\n"
 			"^3The shop is a window:^7 press ^3B^7 in the buy phase, pick a tab "
 			"(^3Defence^7, ^3Attack^7, ^3Consumables^7) and buy with a left click, "
-			"^3B^7 or ^3ESC^7 closes it",
-			MOBA_ModeName(),
+			"^3B^7 or ^3ESC^7 closes it. You own ^3two^7 items, they sit in the "
+			"^3%c^7 and ^3%c^7 slots, press the slot key to use one, or press it "
+			"twice to use it on yourself",
+			MOBA_ABILITIES_PER_HERO, MOBA_ModeName(),
 			MOBA_ModeAllPick() ?
 				"no bans and no captains, every player takes any hero he likes with "
 				"!pick N or a click in the window" :
 				"the two captains get !ban N and !pick N, every captain picks one "
 				"hero per player of his team and everybody takes one hero out of "
-				"the pool of his team afterwards" );
+				"the pool of his team afterwards",
+			MOBA_ITEM_KEY_A, MOBA_ITEM_KEY_B );
+		return qtrue;
+	}
+	if ( !Q_stricmp( cmd, "!use1" ) )
+	{
+		MOBA_UseItem( ent, 0 );
+		return qtrue;
+	}
+	if ( !Q_stricmp( cmd, "!use2" ) )
+	{
+		MOBA_UseItem( ent, 1 );
 		return qtrue;
 	}
 	if ( !Q_stricmp( cmd, "!draft" ) )
@@ -3238,6 +5068,123 @@ qboolean MOBA_HandleChat( gentity_t *ent, const char *msg )
 	if ( !Q_stricmp( cmd, "!status" ) )
 	{
 		MOBA_ShowStatus( ent );
+		return qtrue;
+	}
+	if ( !Q_stricmp( cmd, "!ready" ) )
+	{
+		int num = ent->s.number;
+
+		if ( mobaPhase != MOBA_PHASE_LOBBY )
+		{
+			MOBA_Self( ent, "^3There is no lobby waiting right now^7 - "
+				"!ready only works before the draft\n" );
+			return qtrue;
+		}
+		if ( num < 0 || num >= MAX_CLIENTS || ( ent->r.svFlags & SVF_BOT ) )
+		{
+			return qtrue;
+		}
+		if ( mobaReady[num] )
+		{
+			MOBA_Self( ent, "^3You are already ready.\n" );
+			return qtrue;
+		}
+		mobaReady[num] = qtrue;
+		MOBA_CPAll( "^2%s is ready!^7 (%i/%i)\n", ent->client->pers.netname,
+			MOBA_ReadyCount(), MOBA_ReadyNeeded() );
+		if ( MOBA_AllReady() )
+		{
+			MOBA_CPAll( "^2Everybody is here - the draft starts!\n" );
+		}
+		return qtrue;
+	}
+	if ( !Q_stricmp( cmd, "!restart" ) )
+	{
+		int num = ent->s.number, i, votes = 0, humans = 0, needed;
+
+		if ( num < 0 || num >= MAX_CLIENTS || ( ent->r.svFlags & SVF_BOT ) )
+		{
+			return qtrue;
+		}
+
+		// a new vote opens a 60 second window
+		if ( mobaRestartVoteStart == 0 ||
+			level.time > mobaRestartVoteStart + 60000 )
+		{
+			mobaRestartVoteStart = level.time;
+			memset( mobaRestartVoted, 0, sizeof( mobaRestartVoted ) );
+		}
+		if ( mobaRestartVoted[num] )
+		{
+			MOBA_Self( ent, "^3You already voted for a restart (60s window).\n" );
+			return qtrue;
+		}
+		mobaRestartVoted[num] = qtrue;
+
+		// more than half of the humans on both teams, bots never vote
+		for ( i = 0; i < level.maxclients && i < MAX_CLIENTS; i++ )
+		{
+			if ( !MOBA_SlotActive( i ) || ( g_entities[i].r.svFlags & SVF_BOT ) )
+			{
+				continue;
+			}
+			humans++;
+			if ( mobaRestartVoted[i] )
+			{
+				votes++;
+			}
+		}
+		needed = humans / 2 + 1;
+
+		MOBA_CPAll( "^3Restart vote:^7 %i/%i within a minute\n", votes, needed );
+		if ( votes >= needed )
+		{
+			MOBA_CPAll( "^3Majority agrees - restarting the match!\n" );
+			MOBA_RestartMatch();
+		}
+		return qtrue;
+	}
+	if ( !Q_stricmp( cmd, "!ff" ) )
+	{
+		int num = ent->s.number;
+		team_t team;
+		const char *teamName;
+
+		if ( num < 0 || num >= MAX_CLIENTS || ( ent->r.svFlags & SVF_BOT ) )
+		{
+			return qtrue;
+		}
+		team = ent->client->sess.sessionTeam;
+		if ( team != TEAM_RED && team != TEAM_BLUE )
+		{
+			MOBA_Self( ent, "^3!ff works only while your side is in the match.\n" );
+			return qtrue;
+		}
+		teamName = ( team == TEAM_RED ) ? "red" : "blue";
+
+		// one minute for the whole team to agree
+		if ( mobaFFVoteStart == 0 ||
+			level.time > mobaFFVoteStart + 60000 )
+		{
+			mobaFFVoteStart = level.time;
+			memset( mobaFFVoted, 0, sizeof( mobaFFVoted ) );
+		}
+		if ( mobaFFVoted[num] )
+		{
+			MOBA_Self( ent, "^3You already said !ff (60s window).\n" );
+			return qtrue;
+		}
+		mobaFFVoted[num] = qtrue;
+
+		MOBA_CPAll( "^1%s !ff^7 - the whole %s team must agree within a minute\n",
+			ent->client->pers.netname, teamName );
+
+		if ( MOBA_TeamFFComplete( team ) )
+		{
+			MOBA_CPAll( "^1Team %s concedes!^7 %s takes the match.\n", teamName,
+				( team == TEAM_RED ) ? "blue" : "red" );
+			MOBA_RestartMatch();
+		}
 		return qtrue;
 	}
 

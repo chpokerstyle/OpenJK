@@ -28,6 +28,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include "cg_local.h"
 #include "game/bg_saga.h"
 #include "ui/ui_shared.h"
+#include "cg_moba.h"
 
 /*
 =================
@@ -295,6 +296,8 @@ int cmdcmp( const void *a, const void *b ) {
 static consoleCommand_t	commands[] = {
 	{ "+scores",					CG_ScoresDown_f },
 	{ "-scores",					CG_ScoresUp_f },
+	{ "+mobaflame",					CG_Moba_FlameDown_f },
+	{ "-mobaflame",					CG_Moba_FlameUp_f },
 	{ "briefing",					CG_SiegeBriefing_f },
 	{ "clientlist",					CG_ClientList_f },
 	{ "forcenext",					CG_NextForcePower_f },

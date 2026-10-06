@@ -7231,6 +7231,13 @@ static int UI_MapCountByGameType(qboolean singlePlayer) {
 	if (game == GT_TEAM)
 		game = GT_FFA;
 
+	// MOBA mod (Magic Wands): the two MOBA modes are team games for the engine
+	// (g_moba.c turns them into GT_TEAM), so give them the same map set as
+	// Team FFA. No .arena file declares the MOBA type bits, without this the
+	// map picker would show no maps at all in the MOBA modes.
+	if ( game == GT_MOBA_CAPTAIN || game == GT_MOBA_ALLPICK )
+		game = GT_TEAM;
+
 	//Since GT_CTY uses the same entities as CTF, use the same map sets
 	if ( game == GT_CTY )
 		game = GT_CTF;

@@ -1394,6 +1394,10 @@ void CG_DrawHUD(centity_t	*cent)
 
 			CG_DrawArmor(menuHUD);
 			CG_DrawHealth(menuHUD);
+
+			// the green mana crystals of the MagicWands MOBA mod, anchored to the
+			// armor tics so the bar stays next to the armor, one column to the right
+			CG_Moba_DrawMana(menuHUD);
 		}
 		else
 		{

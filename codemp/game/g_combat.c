@@ -4454,7 +4454,7 @@ void G_Damage( gentity_t *targ, gentity_t *inflictor, gentity_t *attacker, vec3_
 	{
 		return;
 	}
-	damage = MOBA_AdjustDamage( targ, attacker, damage );
+	damage = MOBA_AdjustDamage( targ, attacker, inflictor, mod, damage );
 
 	if (mod == MOD_DEMP2 && targ && targ->inuse && targ->client)
 	{

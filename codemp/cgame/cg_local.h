@@ -885,6 +885,13 @@ typedef struct cg_s {
 	// powerup active flashing
 	int			powerupActive;
 	int			powerupTime;
+	// MOBA invisibility state per cloaked client: left ms, when we last got it,
+	// and what this client is allowed to see (MOBA_INVIS_*). The server works
+	// the mode out per viewer, so the same player is a ghost to an ally and gone
+	// to an enemy.
+	int			mobaInvisLeft[MAX_CLIENTS];
+	int			mobaInvisTime[MAX_CLIENTS];
+	int			mobaInvisMode[MAX_CLIENTS];
 
 	// attacking player
 	int			attackerTime;
@@ -1017,6 +1024,8 @@ Ghoul2 Insert End
 
 	chatBoxItem_t		chatItems[MAX_CHATBOX_ITEMS];
 	int					chatItemActive;
+
+	// MOBA invisibility state per client: left ms, when we last got it
 
 #if 0
 	int					snapshotTimeoutTime;

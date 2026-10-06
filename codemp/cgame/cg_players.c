@@ -23,6 +23,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 // cg_players.c -- handle the media and animation for player entities
 #include "cg_local.h"
+#include "moba_content.h"
 #include "ghoul2/G2.h"
 #include "game/bg_saga.h"
 
@@ -8892,6 +8893,65 @@ void CG_Player( centity_t *cent ) {
 		}
 		else
 		{
+			cent->trickAlpha = 255;
+			cent->trickAlphaTime = cg.time;
+		}
+	}
+
+// MOBA invisibility cloak. The server broadcasts "mobaInvis clientNum
+	// msLeft mode" to every client and only when the value changes, so the count
+	// down runs here from the moment it arrived instead of arriving in steps.
+	// The mode is the server's answer to "who is looking": an enemy gets
+	// MOBA_INVIS_HIDDEN and cannot see the wearer at all, an ally, the wearer
+	// itself and the spectators get MOBA_INVIS_GHOST and see the body through the
+	// cloak. Without that the cloak would either be useless to the team or hand
+	// every enemy a free hit.
+	//
+	// It has to be applied after the mind trick above: that block owns
+	// trickAlpha and drives it back to 255 for anyone it does not have hold of,
+	// which would wipe out a cloak every single frame. When both are on the same
+	// player the cloak wins, because it is the one that must not be seen.
+	if ( cent->currentState.clientNum >= 0 && cent->currentState.clientNum < MAX_CLIENTS )
+	{
+		int clientNum = cent->currentState.clientNum;
+		int mode = cg.mobaInvisMode[ clientNum ];
+		int invisLeft = cg.mobaInvisLeft[ clientNum ] - ( cg.time - cg.mobaInvisTime[ clientNum ] );
+
+		if ( mode != MOBA_INVIS_NONE && invisLeft > 0 )
+		{
+			float alpha, from;
+
+			// an enemy fades out completely, an ally holds a see-through body
+			from = ( mode == MOBA_INVIS_GHOST ) ? (float)MOBA_INVIS_GHOST_ALPHA : 1.0f;
+
+			if ( invisLeft >= MOBA_ITEM_CLOAK_FADE )
+			{
+				alpha = from;
+			}
+			else
+			{
+				// the model comes back over the last MOBA_ITEM_CLOAK_FADE ms, so
+				// alpha follows what is left rather than the other way around
+				alpha = from + ( (float)invisLeft / (float)MOBA_ITEM_CLOAK_FADE ) *
+					( 255.0f - from );
+			}
+
+			if ( alpha > 255.0f )
+			{
+				alpha = 255.0f;
+			}
+
+			// No RF_FORCE_ENT_ALPHA here: trickAlpha is consumed as a plain
+			// shader alpha (legs.shaderRGBA[3]), so OR-ing that bit in would push
+			// the value past 255 and clamp it to fully opaque instead.
+			cent->trickAlpha = (int)alpha;
+			cent->trickAlphaTime = cg.time;
+			doAlpha = 1;
+		}
+		else if ( cg.mobaInvisLeft[ clientNum ] > 0 )
+		{
+			// the cloak ran out between two broadcasts, so put the body back now
+			// instead of waiting up to a second for the server to say 0
 			cent->trickAlpha = 255;
 			cent->trickAlphaTime = cg.time;
 		}

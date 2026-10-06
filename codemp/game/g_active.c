@@ -2132,6 +2132,15 @@ void ClientThink_real( gentity_t *ent ) {
 		client->ps.eFlags &= ~EF_JETPACK_FLAMING;
 	}
 
+	// magic_wands MOBA mod: the buy phase is a freeze, everybody stays planted on
+	// the spawn until the round clock starts. Set after the health/vehicle logic
+	// above, so a living player really cannot walk or jump.
+	if ( MOBA_Active() && MOBA_GetPhase() == MOBA_PHASE_BUY &&
+		client->ps.stats[STAT_HEALTH] > 0 )
+	{
+		client->ps.pm_type = PM_FREEZE;
+	}
+
 #define	SLOWDOWN_DIST	128.0f
 #define	MIN_NPC_SPEED	16.0f
 
@@ -3560,8 +3569,11 @@ void ClientThink( int clientNum, usercmd_t *ucmd ) {
 		// same left click that bans or picks a hero must not swing the saber. The
 		// engine keeps no other cgame panel, so this is the only place that can
 		// take the attack out of the command before the player state is built.
+		// The buy phase freezes the round start as well, so no shot or force
+		// power sneaks out before the clock starts.
 		if ( MOBA_Active() &&
-			( MOBA_GetPhase() == MOBA_PHASE_DRAFT || MOBA_GetPhase() == MOBA_PHASE_DRAFT_ASSIGN ) )
+			( MOBA_GetPhase() == MOBA_PHASE_DRAFT || MOBA_GetPhase() == MOBA_PHASE_DRAFT_ASSIGN ||
+				MOBA_GetPhase() == MOBA_PHASE_BUY ) )
 		{
 			ent->client->pers.cmd.buttons &= ~(BUTTON_ATTACK|BUTTON_ALT_ATTACK|BUTTON_FORCEGRIP|BUTTON_ANY);
 		}
@@ -3574,6 +3586,14 @@ void ClientThink( int clientNum, usercmd_t *ucmd ) {
 	if (ucmd)
 	{
 		ent->client->pers.cmd = *ucmd;
+	}
+
+	// magic_wands MOBA mod: scale the movement axes of the command that is about
+	// to be simulated, so a slow lands on the very frame it is applied and the
+	// engine never sees the un-slowed input
+	if ( clientNum < MAX_CLIENTS )
+	{
+		MOBA_ClientThink( ent );
 	}
 
 /* 	This was moved to clientthink_real, but since its sort of a risky change i left it here for
